@@ -1,0 +1,42 @@
+# Dependências
+node_modules/
+package-lock.json
+yarn.lock
+test-system.js
+test-mongo.js
+padrao_adulto.jpg
+fasttv.db
+
+# Variáveis de ambiente
+.env
+.env.local
+.env.production
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporários
+tmp/
+temp/
+.cache/
+
+# Build
+dist/
+build/
+
+# Covers (se existirem localmente)
+public/
+public/covers/*
+!public/covers/.gitkeep
