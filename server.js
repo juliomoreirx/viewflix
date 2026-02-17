@@ -308,8 +308,10 @@ function strictCORS(req, res, next) {
 
 // ===== FUNÇÕES DE LOGIN E CACHE COM CLOUDSCRAPER =====
 
+const { fazerLoginComPuppeteer } = require('./vouver-puppeteer');
+
 async function fazerLoginVouver(username, password, tentativa = 1) {
-  const MAX_TENTATIVAS = 3;
+  const MAX_TENTATIVAS = 2; // Reduz tentativas com Puppeteer
   
   if (tentativa > MAX_TENTATIVAS) {
     console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas de login`);
@@ -317,150 +319,46 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
   
   if (tentativa > 1) {
-    const delay = tentativa * 2000;
+    const delay = tentativa * 3000;
     console.log(`⏳ Aguardando ${delay/1000}s antes da tentativa ${tentativa}...`);
     await new Promise(resolve => setTimeout(resolve, delay));
   }
   
   console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
   console.log(`👤 Usuário: ${username}`);
-  console.log(`🛡️ Usando Cloudscraper (bypass Cloudflare)`);
+  console.log(`🤖 Usando Puppeteer (navegador real)`);
   
   try {
-    // ===== PASSO 1: GET na página de login (bypass Cloudflare) =====
-    console.log('📡 Passo 1: Acessando página de login (bypass CF)...');
+    const result = await fazerLoginComPuppeteer(username, password, BASE_URL);
     
-    try {
-      const getResponse = await cloudscraperClient.get(`${BASE_URL}/index.php?page=login`);
+    if (result.success && result.cookies.length > 0) {
+      // Salvar cookies no jar do axios
+      result.cookies.forEach(cookie => {
+        const cookieString = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${cookie.path}`;
+        jar.setCookieSync(cookieString, BASE_URL);
+      });
       
-      console.log('✅ Página de login acessada (Cloudflare bypassado)');
-      console.log(`📊 Status: ${getResponse.statusCode || 200}`);
-      
-      const cookies = cloudscraperJar.getCookiesSync(BASE_URL);
-      console.log(`🍪 Cookies iniciais: ${cookies.length}`);
-      
-    } catch (error) {
-      console.warn('⚠️ Erro ao acessar página de login:', error.message);
-    }
-    
-    // Aguarda 1 segundo
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // ===== PASSO 2: POST do login =====
-    console.log('📡 Passo 2: Enviando credenciais...');
-    
-    const formData = {
-      username: username,
-      sifre: password,
-      beni_hatirla: 'on',
-      recaptcha_response: '',
-      login: 'Acessar'
-    };
-    
-    const loginResponse = await cloudscraperClient.post(
-      `${BASE_URL}/index.php?page=login`,
-      formData,
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': `${BASE_URL}/index.php?page=login`,
-          'Origin': BASE_URL
-        },
-        form: true,
-        followAllRedirects: true
-      }
-    );
-    
-    console.log(`📊 Status da resposta: ${loginResponse.statusCode || 200}`);
-    
-    // ===== VERIFICAR COOKIES =====
-    const cookies = cloudscraperJar.getCookiesSync(BASE_URL);
-    console.log(`🍪 Total de cookies após login: ${cookies.length}`);
-    
-    cookies.forEach(cookie => {
-      console.log(`   🍪 ${cookie.key} = ${cookie.value.substring(0, 20)}...`);
-    });
-    
-    // Verificar se tem cookie de sessão
-    const temCookieValido = cookies.some(c => 
-      c.key === 'vouverme' || 
-      c.key.toLowerCase().includes('session') ||
-      c.key.toLowerCase().includes('phpsessid') ||
-      c.key.toLowerCase().includes('auth')
-    );
-    
-    if (temCookieValido) {
       userSession.user = username;
       userSession.pass = password;
-      
-      // Copiar cookies para o client axios também
-      cookies.forEach(cookie => {
-        jar.setCookieSync(cookie.toString(), BASE_URL);
-      });
       
       console.log('✅ Login no Vouver realizado com sucesso!');
-      console.log(`✅ Sessão estabelecida (Cloudflare bypassado)`);
+      console.log('✅ Cookies transferidos para axios');
       
       await atualizarCache();
       return true;
-    }
-    
-    // Verificar redirecionamento ou conteúdo
-    const responseBody = typeof loginResponse.body === 'string' 
-      ? loginResponse.body 
-      : loginResponse.toString();
-    
-    if (responseBody.includes('logout') || 
-        responseBody.includes('sair') || 
-        responseBody.includes('dashboard') ||
-        responseBody.includes('perfil')) {
-      
-      userSession.user = username;
-      userSession.pass = password;
-      
-      cookies.forEach(cookie => {
-        jar.setCookieSync(cookie.toString(), BASE_URL);
-      });
-      
-      console.log('✅ Login realizado (conteúdo autenticado detectado)');
-      await atualizarCache();
-      return true;
-    }
-    
-    console.error('❌ Login falhou - nenhum indicador de sucesso encontrado');
-    console.log('📄 Trecho da resposta:', responseBody.substring(0, 500));
-    
-    return await fazerLoginVouver(username, password, tentativa + 1);
-    
-  } catch (error) {
-    console.error(`❌ Erro na tentativa ${tentativa} de login:`, error.message);
-    
-    if (error.response || error.statusCode) {
-      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.error('📊 DETALHES DO ERRO:');
-      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.error('Status:', error.statusCode || error.response?.status);
-      console.error('Error:', error.error || error.message);
-      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    }
-    
-    // Retry em erros de rede
-    if (error.message.includes('timeout') || 
-        error.message.includes('ECONNRESET') ||
-        error.message.includes('ETIMEDOUT')) {
-      
-      console.log('⚠️ Erro de conexão, tentando novamente...');
+    } else {
+      console.error('❌ Login falhou');
       return await fazerLoginVouver(username, password, tentativa + 1);
     }
     
-    // Se for 403 mesmo com cloudscraper, algo está muito errado
-    if (error.statusCode === 403 || error.response?.status === 403) {
-      console.error('🛑 Erro 403 mesmo com bypass Cloudflare');
-      console.error('💡 Possível solução: usar proxy ou VPN');
-      return false;
+  } catch (error) {
+    console.error(`❌ Erro na tentativa ${tentativa}:`, error.message);
+    
+    if (tentativa < MAX_TENTATIVAS) {
+      return await fazerLoginVouver(username, password, tentativa + 1);
     }
     
-    return await fazerLoginVouver(username, password, tentativa + 1);
+    return false;
   }
 }
 
@@ -468,15 +366,12 @@ async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    const response = await cloudscraperClient.get(`${BASE_URL}/app/_search.php?q=a`, {
-      timeout: 30000,
-      json: true
+    const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, { 
+      headers: HEADERS,
+      timeout: 30000
     });
     
-    const data = typeof response.body === 'string' 
-      ? JSON.parse(response.body)
-      : response.body;
-    
+    const data = response.data;
     let rawMovies = [], rawSeries = [];
     
     if (data.data) {
@@ -627,10 +522,11 @@ async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
   
   try {
-    let response = await cloudscraperClient.get(`${BASE_URL}/index.php`, {
-      qs: { page: pageType, id },
+    let response = await client.get(`${BASE_URL}/index.php`, {
+      params: { page: pageType, id },
+      headers: HEADERS,
       timeout: 15000,
-      encoding: null
+      responseType: 'arraybuffer'
     });
     
     let html = null;
@@ -638,7 +534,7 @@ async function buscarDetalhes(id, type) {
     
     for (const encoding of encodings) {
       try {
-        const decoded = iconv.decode(Buffer.from(response.body), encoding);
+        const decoded = iconv.decode(Buffer.from(response.data), encoding);
         if (!decoded.includes('�') && !decoded.includes('?�')) {
           html = decoded;
           console.log(`✅ Encoding correto detectado: ${encoding}`);
@@ -650,23 +546,24 @@ async function buscarDetalhes(id, type) {
     }
     
     if (!html) {
-      html = iconv.decode(Buffer.from(response.body), 'ISO-8859-1');
+      html = iconv.decode(Buffer.from(response.data), 'ISO-8859-1');
       html = corrigirCaracteresEspeciais(html);
     }
     
     let $ = cheerio.load(html, { decodeEntities: false });
 
     if ($('.tab_episode').length === 0 && type !== 'movies') {
-      response = await cloudscraperClient.get(`${BASE_URL}/index.php`, {
-        qs: { page: 'moviedetail', id },
+      response = await client.get(`${BASE_URL}/index.php`, {
+        params: { page: 'moviedetail', id },
+        headers: HEADERS,
         timeout: 15000,
-        encoding: null
+        responseType: 'arraybuffer'
       });
       
       html = null;
       for (const encoding of encodings) {
         try {
-          const decoded = iconv.decode(Buffer.from(response.body), encoding);
+          const decoded = iconv.decode(Buffer.from(response.data), encoding);
           if (!decoded.includes('�') && !decoded.includes('?�')) {
             html = decoded;
             break;
@@ -677,7 +574,7 @@ async function buscarDetalhes(id, type) {
       }
       
       if (!html) {
-        html = iconv.decode(Buffer.from(response.body), 'ISO-8859-1');
+        html = iconv.decode(Buffer.from(response.data), 'ISO-8859-1');
         html = corrigirCaracteresEspeciais(html);
       }
       

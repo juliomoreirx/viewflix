@@ -40,6 +40,9 @@
     "moment": "^2.30.1",
     "mongoose": "^9.0.2",
     "node-telegram-bot-api": "^0.67.0",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "tough-cookie": "^6.0.0"
   },
   "devDependencies": {
