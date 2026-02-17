@@ -373,13 +373,16 @@ async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    // ===== ESTRATÉGIA 1: VIA PUPPETEER (MAIS CONFIÁVEL) =====
-    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
-      console.log('🤖 Tentando atualizar cache via Puppeteer (mesma sessão do login)...');
+    // ===== LER ARQUIVO content.json (PRIORIDADE) =====
+    const contentPath = path.join(__dirname, 'content.json');
+    
+    if (fs.existsSync(contentPath)) {
+      console.log('📦 Carregando catálogo do arquivo content.json...');
       
-      const cacheData = await buscarCacheComPuppeteer(COOKIES_PUPPETEER, BASE_URL);
-      
-      if (cacheData) {
+      try {
+        const fileContent = fs.readFileSync(contentPath, 'utf8');
+        const cacheData = JSON.parse(fileContent);
+        
         let rawMovies = [], rawSeries = [];
         
         if (cacheData.data) {
@@ -395,87 +398,23 @@ async function atualizarCache() {
           CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
           
-          console.log(`✅ Cache atualizado via Puppeteer: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
-          return;
+          console.log(`✅ Cache carregado do arquivo JSON: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          return; // ← Retorna aqui, não tenta buscar remotamente
         } else {
-          console.log('⚠️ Puppeteer retornou dados vazios, tentando fallback...');
+          console.log('⚠️ Arquivo content.json está vazio');
         }
-      } else {
-        console.log('⚠️ Puppeteer falhou, tentando fallback...');
+      } catch (jsonError) {
+        console.error('❌ Erro ao ler content.json:', jsonError.message);
       }
+    } else {
+      console.log('⚠️ Arquivo content.json não encontrado');
+      console.log('💡 Crie o arquivo content.json na raiz do projeto com o catálogo');
     }
     
-    // ===== ESTRATÉGIA 2: VIA AXIOS COM PROXY =====
-    console.log('⚠️ Tentando via axios como fallback...');
-    
-    const axiosConfig = {
-      headers: HEADERS,
-      timeout: 30000
-    };
-    
-    if (PROXY_FUNCIONANDO) {
-      axiosConfig.proxy = {
-        host: PROXY_FUNCIONANDO.host,
-        port: PROXY_FUNCIONANDO.port,
-        protocol: 'http'
-      };
-      console.log(`🌐 Usando proxy salva: ${PROXY_FUNCIONANDO.host}:${PROXY_FUNCIONANDO.port}`);
-    }
-    
-    const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, axiosConfig);
-    
-    const data = response.data;
-    let rawMovies = [], rawSeries = [];
-    
-    if (data.data) {
-      rawMovies = data.data.movies || [];
-      rawSeries = data.data.series || [];
-    } else if (data.movies) {
-      rawMovies = data.movies;
-      rawSeries = data.series;
-    }
-    
-    CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-    CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
-    CACHE_CONTEUDO.lastUpdated = Date.now();
-    
-    console.log(`✅ Cache atualizado via axios: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+    console.error("⚠️ Cache não pôde ser carregado - sistema funcionará em modo limitado");
     
   } catch (error) {
     console.error("❌ Erro ao atualizar cache:", error.message);
-    
-    // ===== ESTRATÉGIA 3: VIA AXIOS SEM PROXY =====
-    if (PROXY_FUNCIONANDO) {
-      console.log('⚠️ Tentando sem proxy...');
-      
-      try {
-        const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, { 
-          headers: HEADERS,
-          timeout: 30000
-        });
-        
-        const data = response.data;
-        let rawMovies = [], rawSeries = [];
-        
-        if (data.data) {
-          rawMovies = data.data.movies || [];
-          rawSeries = data.data.series || [];
-        } else if (data.movies) {
-          rawMovies = data.movies;
-          rawSeries = data.series;
-        }
-        
-        CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-        CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
-        CACHE_CONTEUDO.lastUpdated = Date.now();
-        
-        console.log(`✅ Cache atualizado (sem proxy): ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
-        
-      } catch (fallbackError) {
-        console.error("❌ Erro mesmo sem proxy:", fallbackError.message);
-        console.error("⚠️ Cache permanece vazio - sistema funcionará em modo limitado");
-      }
-    }
   }
 }
 

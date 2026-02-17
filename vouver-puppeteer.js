@@ -434,13 +434,54 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
     
     console.log('✅ Página de cache acessada');
     
+    // ===== DEBUG: VER O QUE FOI RETORNADO =====
+    const pageContent = await page.evaluate(() => {
+      return {
+        bodyText: document.body.innerText,
+        bodyHTML: document.body.innerHTML.substring(0, 500),
+        contentType: document.contentType || 'unknown',
+        title: document.title
+      };
+    });
+    
+    console.log('📊 DEBUG - Resposta da página:');
+    console.log('   Título:', pageContent.title);
+    console.log('   Content-Type:', pageContent.contentType);
+    console.log('   Primeiros 200 chars do body:', pageContent.bodyText.substring(0, 200));
+    
+    // Verificar se é HTML de erro
+    if (pageContent.bodyText.includes('404') || 
+        pageContent.bodyText.includes('Not Found') ||
+        pageContent.bodyText.includes('Forbidden') ||
+        pageContent.title.includes('404') ||
+        pageContent.title.includes('403')) {
+      
+      console.log('❌ Página de erro detectada (404/403)');
+      console.log('📄 Body completo:', pageContent.bodyText.substring(0, 500));
+      
+      await browser.close();
+      return null;
+    }
+    
     // Extrair JSON da página
     const cacheData = await page.evaluate(() => {
       try {
-        const bodyText = document.body.innerText;
-        return JSON.parse(bodyText);
+        const bodyText = document.body.innerText.trim();
+        
+        // Tentar parsear direto
+        const parsed = JSON.parse(bodyText);
+        return parsed;
       } catch (e) {
-        console.log('Erro ao parsear JSON:', e.message);
+        // Se falhar, tentar encontrar JSON no HTML
+        try {
+          const pre = document.querySelector('pre');
+          if (pre) {
+            return JSON.parse(pre.innerText);
+          }
+        } catch (e2) {
+          console.log('Erro ao parsear JSON:', e.message);
+        }
+        
         return null;
       }
     });
@@ -467,6 +508,7 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
       return cacheData;
     } else {
       console.log('⚠️ Resposta do cache não é JSON válido');
+      console.log('📄 Body text recebido:', pageContent.bodyText.substring(0, 300));
       return null;
     }
     
