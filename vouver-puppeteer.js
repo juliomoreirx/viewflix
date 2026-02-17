@@ -4,10 +4,9 @@ const { obterProxiesValidas } = require('./proxy-scraper');
 const fs = require('fs');
 const path = require('path');
 
-// Usar plugin stealth (anti-detecção)
 puppeteer.use(StealthPlugin());
 
-// Cache de proxies (evita buscar toda vez)
+// Cache de proxies
 let PROXIES_CACHE = null;
 let CACHE_TIMESTAMP = 0;
 const CACHE_DURATION = 30 * 60 * 1000; // 30 minutos
@@ -15,14 +14,12 @@ const CACHE_DURATION = 30 * 60 * 1000; // 30 minutos
 async function obterProxies() {
   const agora = Date.now();
   
-  // Se tem cache válido (menos de 30 min), usa
   if (PROXIES_CACHE && (agora - CACHE_TIMESTAMP) < CACHE_DURATION) {
     console.log('✅ Usando proxies do cache (válidas por mais ' + 
                 Math.round((CACHE_DURATION - (agora - CACHE_TIMESTAMP)) / 60000) + ' minutos)');
     return PROXIES_CACHE;
   }
   
-  // Buscar proxies novas
   console.log('🔄 Cache expirado ou primeiro uso, buscando proxies novas...\n');
   const proxiesNovas = await obterProxiesValidas();
   
@@ -32,25 +29,21 @@ async function obterProxies() {
     return proxiesNovas;
   }
   
-  // Se não achou nenhuma, usa cache antigo (se tiver)
   if (PROXIES_CACHE) {
     console.log('⚠️ Nenhuma proxy nova, usando cache antigo');
     return PROXIES_CACHE;
   }
   
-  // Sem cache e sem proxies novas = erro
   throw new Error('Nenhuma proxy disponível');
 }
 
 async function salvarScreenshot(page, proxy, motivo) {
   try {
-    // Criar pasta screenshots se não existir
     const screenshotsDir = path.join(__dirname, 'screenshots');
     if (!fs.existsSync(screenshotsDir)) {
       fs.mkdirSync(screenshotsDir);
     }
     
-    // Nome do arquivo com IP e timestamp
     const timestamp = Date.now();
     const nomeArquivo = `${proxy.host.replace(/\./g, '-')}_${timestamp}_${motivo}.png`;
     const caminhoCompleto = path.join(screenshotsDir, nomeArquivo);
@@ -62,7 +55,6 @@ async function salvarScreenshot(page, proxy, motivo) {
     
     console.log(`📸 Screenshot salvo: ${nomeArquivo}`);
     
-    // Salvar também o HTML
     const htmlContent = await page.content();
     const htmlArquivo = `${proxy.host.replace(/\./g, '-')}_${timestamp}_${motivo}.html`;
     const htmlCaminho = path.join(screenshotsDir, htmlArquivo);
@@ -83,7 +75,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
   let page;
   
   try {
-    // Obter proxies dinâmicas
     const proxies = await obterProxies();
     
     if (proxies.length === 0) {
@@ -94,7 +85,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
     console.log(`🌐 ${proxies.length} proxies disponíveis para tentar`);
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
     
-    // TENTAR TODAS AS PROXIES
     for (let i = 0; i < proxies.length; i++) {
       const proxy = proxies[i];
       
@@ -128,8 +118,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
         
         page = await browser.newPage();
         
-        // SEM autenticação (proxies grátis não precisam)
-        
         page.setDefaultTimeout(45000);
         page.setDefaultNavigationTimeout(45000);
         
@@ -154,7 +142,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
         
         await new Promise(resolve => setTimeout(resolve, 15000));
         
-        // Verificar se foi bloqueado
         const pageInfo = await page.evaluate(() => {
           return {
             title: document.title,
@@ -171,10 +158,8 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
           console.log('❌ BLOQUEADO pelo Cloudflare!');
           console.log(`📄 Mensagem: ${pageInfo.bodyText}`);
           
-          // SALVAR SCREENSHOT COM IP
           await salvarScreenshot(page, proxy, 'BLOQUEADO');
           
-          // Fechar e tentar próxima
           await browser.close();
           browser = null;
           
@@ -198,7 +183,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
         
         console.log('✅ Página de login carregada');
         
-        // Verificar formulário
         const temFormulario = await page.evaluate(() => {
           return {
             hasForm: !!document.getElementById('username'),
@@ -253,6 +237,10 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
             const username = document.getElementById('username').value;
             const sifre = document.getElementById('sifre').value;
             
+            const timeout = setTimeout(() => {
+              resolve({ success: false, error: 'Timeout após 30s' });
+            }, 30000);
+            
             fetch('app/_login.php', {
               method: 'POST',
               headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -264,6 +252,7 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
             })
             .then(response => response.text())
             .then(data => {
+              clearTimeout(timeout);
               if (data.trim() == '1') {
                 resolve({ success: true, response: data });
               } else {
@@ -271,6 +260,7 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
               }
             })
             .catch(error => {
+              clearTimeout(timeout);
               resolve({ success: false, error: error.message });
             });
           });
@@ -329,7 +319,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
           console.log(`⚡ Latência: ${proxy.latency}ms`);
           console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
           
-          // Screenshot de sucesso
           await salvarScreenshot(page, proxy, 'SUCESSO');
           
           return {
@@ -347,7 +336,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
       } catch (error) {
         console.error(`❌ Erro com proxy ${proxy.host}:${proxy.port}:`, error.message);
         
-        // Salvar screenshot do erro
         if (page) {
           await salvarScreenshot(page, proxy, 'ERRO');
         }
@@ -359,7 +347,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
           browser = null;
         }
         
-        // Se não é a última proxy, continua
         if (i < proxies.length - 1) {
           console.log(`⚠️ Tentando próxima proxy...\n`);
           continue;
@@ -367,7 +354,6 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
       }
     }
     
-    // Se chegou aqui, todas falharam
     console.error('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.error('❌ TODAS AS PROXIES FALHARAM');
     console.error(`📊 Total testadas: ${proxies.length}`);
@@ -419,14 +405,12 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
     
     page = await browser.newPage();
     
-    // Setar os mesmos cookies do login
     await page.setCookie(...cookies);
     
     console.log('✅ Cookies do login aplicados');
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // Buscar cache
     await page.goto(`${baseUrl}/app/_search.php?q=a`, {
       waitUntil: 'domcontentloaded',
       timeout: 30000
@@ -434,45 +418,12 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
     
     console.log('✅ Página de cache acessada');
     
-    // ===== DEBUG: VER O QUE FOI RETORNADO =====
-    const pageContent = await page.evaluate(() => {
-      return {
-        bodyText: document.body.innerText,
-        bodyHTML: document.body.innerHTML.substring(0, 500),
-        contentType: document.contentType || 'unknown',
-        title: document.title
-      };
-    });
-    
-    console.log('📊 DEBUG - Resposta da página:');
-    console.log('   Título:', pageContent.title);
-    console.log('   Content-Type:', pageContent.contentType);
-    console.log('   Primeiros 200 chars do body:', pageContent.bodyText.substring(0, 200));
-    
-    // Verificar se é HTML de erro
-    if (pageContent.bodyText.includes('404') || 
-        pageContent.bodyText.includes('Not Found') ||
-        pageContent.bodyText.includes('Forbidden') ||
-        pageContent.title.includes('404') ||
-        pageContent.title.includes('403')) {
-      
-      console.log('❌ Página de erro detectada (404/403)');
-      console.log('📄 Body completo:', pageContent.bodyText.substring(0, 500));
-      
-      await browser.close();
-      return null;
-    }
-    
-    // Extrair JSON da página
     const cacheData = await page.evaluate(() => {
       try {
         const bodyText = document.body.innerText.trim();
-        
-        // Tentar parsear direto
         const parsed = JSON.parse(bodyText);
         return parsed;
       } catch (e) {
-        // Se falhar, tentar encontrar JSON no HTML
         try {
           const pre = document.querySelector('pre');
           if (pre) {
@@ -491,7 +442,6 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
     if (cacheData) {
       console.log('✅ Cache obtido via Puppeteer');
       
-      // Log de quantos itens foram obtidos
       let totalMovies = 0;
       let totalSeries = 0;
       
@@ -508,7 +458,6 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
       return cacheData;
     } else {
       console.log('⚠️ Resposta do cache não é JSON válido');
-      console.log('📄 Body text recebido:', pageContent.bodyText.substring(0, 300));
       return null;
     }
     
@@ -525,4 +474,220 @@ async function buscarCacheComPuppeteer(cookies, baseUrl) {
   }
 }
 
-module.exports = { fazerLoginComPuppeteer, buscarCacheComPuppeteer };
+// ===== FUNÇÃO: BUSCAR CACHE ALTERNATIVO =====
+
+async function buscarCacheAlternativo(cookies, baseUrl) {
+  let browser;
+  let page;
+  
+  try {
+    console.log('🔄 Tentando método alternativo de cache...');
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ],
+      timeout: 60000
+    });
+    
+    page = await browser.newPage();
+    await page.setCookie(...cookies);
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    
+    console.log('📡 Acessando página principal...');
+    
+    await page.goto(`${baseUrl}/index.php?page=homepage`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+    
+    console.log('✅ Homepage carregada');
+    
+    await page.goto(`${baseUrl}/app/_search.php?q=a`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+    
+    const cacheData = await page.evaluate(() => {
+      try {
+        return JSON.parse(document.body.innerText);
+      } catch (e) {
+        return null;
+      }
+    });
+    
+    await browser.close();
+    
+    if (cacheData) {
+      console.log('✅ Cache obtido via método alternativo');
+      return cacheData;
+    }
+    
+    return null;
+    
+  } catch (error) {
+    console.error('❌ Método alternativo falhou:', error.message);
+    
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+    
+    return null;
+  }
+}
+
+// ===== FUNÇÃO: BUSCAR DETALHES COM PUPPETEER =====
+
+async function buscarDetalhesComPuppeteer(id, type, cookies, baseUrl) {
+  let browser;
+  let page;
+  
+  try {
+    console.log(`🔍 Buscando detalhes via Puppeteer: ${type}/${id}...`);
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ],
+      timeout: 60000
+    });
+    
+    page = await browser.newPage();
+    
+    await page.setCookie(...cookies);
+    
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    
+    const pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
+    
+    await page.goto(`${baseUrl}/index.php?page=${pageType}&id=${id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+    
+    console.log(`✅ Página de detalhes carregada`);
+    
+    const detalhes = await page.evaluate(() => {
+      const data = { seasons: {}, info: {} };
+      
+      // Título
+      const titleEl = document.querySelector('.left-wrap h2');
+      if (titleEl) {
+        data.title = titleEl.innerText.trim();
+      }
+      
+      // Sinopse
+      const sinopseEl = document.querySelector('.left-wrap p');
+      if (sinopseEl) {
+        data.info.sinopse = sinopseEl.innerText.trim();
+      }
+      
+      // Verificar se é filme ou série
+      const hasEpisodes = document.querySelectorAll('.tab_episode').length > 0;
+      data.mediaType = hasEpisodes ? 'series' : 'movie';
+      
+      // Tags (ano, duração, gênero)
+      const tags = [];
+      document.querySelectorAll('.left-wrap .tag').forEach(tag => {
+        const text = tag.innerText.trim();
+        if (text) tags.push(text);
+      });
+      
+      // IMDB
+      const imdbEl = document.querySelector('.left-wrap .rnd');
+      if (imdbEl) {
+        const imdbText = imdbEl.innerText;
+        const match = imdbText.match(/IMDB\s+([\d.]+)/i);
+        if (match) {
+          data.info.imdb = parseFloat(match[1]);
+        }
+      }
+      
+      // Processar tags
+      tags.forEach(tag => {
+        // Ano
+        if (/^\d{4}$/.test(tag)) {
+          data.info.ano = parseInt(tag);
+        }
+        
+        // Duração (formato HH:MM:SS)
+        const duracaoMatch = tag.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+        if (duracaoMatch) {
+          const horas = parseInt(duracaoMatch[1]);
+          const minutos = parseInt(duracaoMatch[2]);
+          const segundos = parseInt(duracaoMatch[3]);
+          
+          data.info.duracaoMinutos = (horas * 60) + minutos + Math.ceil(segundos / 60);
+          data.info.duracaoTexto = tag;
+        }
+        
+        // Gênero (tudo que não é ano nem duração)
+        if (!tag.includes(':') && isNaN(tag) && !/^\d{4}$/.test(tag)) {
+          if (!data.info.genero) {
+            data.info.genero = tag;
+          }
+        }
+      });
+      
+      // Séries: extrair temporadas e episódios
+      if (data.mediaType === 'series') {
+        document.querySelectorAll('.tab_episode').forEach((tab, index) => {
+          const seasonNum = index + 1;
+          const episodes = [];
+          
+          tab.querySelectorAll('a.ep-list-min').forEach(link => {
+            const epId = link.getAttribute('data-id');
+            const epNameEl = link.querySelector('.ep-title');
+            const epName = epNameEl ? epNameEl.innerText.trim() : '';
+            
+            if (epId && epName) {
+              episodes.push({ name: epName, id: epId });
+            }
+          });
+          
+          if (episodes.length > 0) {
+            data.seasons[seasonNum] = episodes;
+          }
+        });
+      } else {
+        // Filme
+        const idMatch = window.location.href.match(/id=(\d+)/);
+        const videoId = idMatch ? idMatch[1] : '';
+        data.seasons["Filme"] = [{ name: data.title || "Filme Completo", id: videoId }];
+      }
+      
+      return data;
+    });
+    
+    await browser.close();
+    
+    console.log(`✅ Detalhes obtidos via Puppeteer: ${detalhes.title || 'sem título'}`);
+    
+    return detalhes;
+    
+  } catch (error) {
+    console.error(`❌ Erro ao buscar detalhes via Puppeteer: ${error.message}`);
+    
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {}
+    }
+    
+    return null;
+  }
+}
+
+module.exports = { 
+  fazerLoginComPuppeteer, 
+  buscarCacheComPuppeteer, 
+  buscarCacheAlternativo,
+  buscarDetalhesComPuppeteer 
+};

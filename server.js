@@ -17,7 +17,12 @@ const mongoose = require('mongoose');
 const telegramBot = require('./telegram-bot');
 
 // ===== IMPORTA LOGIN E CACHE COM PUPPETEER =====
-const { fazerLoginComPuppeteer, buscarCacheComPuppeteer } = require('./vouver-puppeteer');
+const { 
+  fazerLoginComPuppeteer, 
+  buscarCacheComPuppeteer, 
+  buscarCacheAlternativo,
+  buscarDetalhesComPuppeteer 
+} = require('./vouver-puppeteer');
 
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
 const DOMINIO_PUBLICO = process.env.DOMINIO_PUBLICO || 'http://localhost:3000';
@@ -37,6 +42,9 @@ const BASE_URL = process.env.BASE_URL || 'http://vouver.me';
 const VIDEO_BASE = process.env.VIDEO_BASE || 'http://goplay.icu/series';
 const MOVIE_BASE = process.env.MOVIE_BASE || 'http://goplay.icu/movie';
 
+// Cloudflare Worker
+const CLOUDFLARE_WORKER_URL = process.env.CLOUDFLARE_WORKER_URL;
+
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
 const requiredVars = {
   MONGO_URI,
@@ -54,6 +62,12 @@ for (const [key, value] of Object.entries(requiredVars)) {
 
 if (!MP_ACCESS_TOKEN) {
   console.warn('⚠️ AVISO: MP_ACCESS_TOKEN não definido - pagamentos PIX não funcionarão');
+}
+
+if (CLOUDFLARE_WORKER_URL) {
+  console.log(`☁️ Cloudflare Worker configurado: ${CLOUDFLARE_WORKER_URL}`);
+} else {
+  console.log('⚠️ CLOUDFLARE_WORKER_URL não configurado - usando proxies públicas');
 }
 
 // ===== LOGS DE INICIALIZAÇÃO =====
@@ -165,8 +179,8 @@ app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 // ===== ESTADO GLOBAL =====
 let userSession = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
-let PROXY_FUNCIONANDO = null; // Proxy que funcionou no login
-let COOKIES_PUPPETEER = null; // Cookies do Puppeteer para reutilizar
+let PROXY_FUNCIONANDO = null;
+let COOKIES_PUPPETEER = null;
 
 // ===== FUNÇÕES DE SEGURANÇA =====
 
@@ -299,7 +313,95 @@ function strictCORS(req, res, next) {
   next();
 }
 
-// ===== FUNÇÃO DE LOGIN COM PUPPETEER =====
+// ===== FUNÇÃO: LOGIN VIA CLOUDFLARE WORKER =====
+
+async function fazerLoginViaCloudflare(username, password) {
+  try {
+    console.log('☁️ Fazendo login via Cloudflare Worker...');
+    
+    const response = await axios.post(
+      `${CLOUDFLARE_WORKER_URL}/proxy/app/_login.php`, 
+      new URLSearchParams({
+        'username': username,
+        'password': password,
+        'type': '1'
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'http://vouver.me/index.php?page=login',
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        timeout: 15000,
+        maxRedirects: 5
+      }
+    );
+    
+    console.log('📊 Resposta do login:', response.data);
+    
+    if (response.data && response.data.toString().trim() === '1') {
+      console.log('✅ Login AJAX via Cloudflare Worker bem-sucedido!');
+      
+      const setCookieHeaders = response.headers['set-cookie'] || [];
+      const cookies = [];
+      
+      if (Array.isArray(setCookieHeaders)) {
+        setCookieHeaders.forEach(cookieStr => {
+          const parts = cookieStr.split(';')[0].split('=');
+          if (parts.length === 2) {
+            cookies.push({
+              name: parts[0].trim(),
+              value: parts[1].trim(),
+              domain: '.vouver.me',
+              path: '/',
+              secure: false,
+              httpOnly: false
+            });
+          }
+        });
+      }
+      
+      if (cookies.length === 0) {
+        console.log('⚠️ Nenhum cookie na resposta, criando cookie padrão...');
+        cookies.push({
+          name: 'PHPSESSID',
+          value: 'cloudflare-' + Date.now() + '-' + Math.random().toString(36).substring(7),
+          domain: '.vouver.me',
+          path: '/',
+          secure: false,
+          httpOnly: false
+        });
+      }
+      
+      console.log(`🍪 ${cookies.length} cookies extraídos`);
+      
+      return {
+        success: true,
+        cookies: cookies
+      };
+    } else {
+      console.log('❌ Login falhou, resposta:', response.data);
+      return {
+        success: false,
+        cookies: []
+      };
+    }
+    
+  } catch (error) {
+    console.error('❌ Erro ao fazer login via Cloudflare Worker:', error.message);
+    if (error.response) {
+      console.error('   Status:', error.response.status);
+      console.error('   Data:', error.response.data);
+    }
+    return {
+      success: false,
+      cookies: []
+    };
+  }
+}
+
+// ===== FUNÇÃO DE LOGIN (CLOUDFLARE WORKER PRIMEIRO) =====
 
 async function fazerLoginVouver(username, password, tentativa = 1) {
   const MAX_TENTATIVAS = 2;
@@ -317,13 +419,41 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   
   console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
   console.log(`👤 Usuário: ${username}`);
-  console.log(`🤖 Usando Puppeteer (navegador real)`);
   
   try {
+    // ===== ESTRATÉGIA 1: CLOUDFLARE WORKER (PRIORIDADE) =====
+    if (CLOUDFLARE_WORKER_URL) {
+      console.log('☁️ Usando Cloudflare Worker como proxy...');
+      
+      const result = await fazerLoginViaCloudflare(username, password);
+      
+      if (result.success) {
+        userSession.user = username;
+        userSession.pass = password;
+        
+        result.cookies.forEach(cookie => {
+          const cookieString = `${cookie.name}=${cookie.value}; Domain=${cookie.domain || '.vouver.me'}; Path=${cookie.path || '/'}`;
+          jar.setCookieSync(cookieString, BASE_URL);
+        });
+        
+        COOKIES_PUPPETEER = result.cookies;
+        
+        console.log('✅ Login via Cloudflare Worker realizado com sucesso!');
+        console.log(`💾 ${result.cookies.length} cookies salvos`);
+        
+        await atualizarCache();
+        return true;
+      } else {
+        console.log('⚠️ Cloudflare Worker falhou, tentando Puppeteer...');
+      }
+    }
+    
+    // ===== ESTRATÉGIA 2: PUPPETEER COM PROXY (FALLBACK) =====
+    console.log('🤖 Usando Puppeteer (navegador real)');
+    
     const result = await fazerLoginComPuppeteer(username, password, BASE_URL);
     
     if (result.success && result.cookies.length > 0) {
-      // Salvar cookies no jar do axios
       result.cookies.forEach(cookie => {
         const cookieString = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${cookie.path}`;
         jar.setCookieSync(cookieString, BASE_URL);
@@ -332,7 +462,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       userSession.user = username;
       userSession.pass = password;
       
-      // ===== SALVAR PROXY QUE FUNCIONOU =====
       if (result.proxy) {
         const [host, port] = result.proxy.split(':');
         PROXY_FUNCIONANDO = {
@@ -342,12 +471,10 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         console.log(`💾 Proxy salva para uso futuro: ${result.proxy}`);
       }
       
-      // ===== SALVAR COOKIES DO PUPPETEER =====
       COOKIES_PUPPETEER = result.cookies;
-      console.log(`💾 ${result.cookies.length} cookies do Puppeteer salvos para cache`);
+      console.log(`💾 ${result.cookies.length} cookies do Puppeteer salvos`);
       
       console.log('✅ Login no Vouver realizado com sucesso!');
-      console.log('✅ Cookies transferidos para axios');
       
       await atualizarCache();
       return true;
@@ -367,13 +494,13 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
-// ===== FUNÇÃO: ATUALIZAR CACHE (VIA PUPPETEER PRIMEIRO) =====
+// ===== FUNÇÃO: ATUALIZAR CACHE (CLOUDFLARE WORKER PRIMEIRO) =====
 
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    // ===== LER ARQUIVO content.json (PRIORIDADE) =====
+    // ===== 1. TENTAR ARQUIVO LOCAL PRIMEIRO (RÁPIDO) =====
     const contentPath = path.join(__dirname, 'content.json');
     
     if (fs.existsSync(contentPath)) {
@@ -399,7 +526,7 @@ async function atualizarCache() {
           CACHE_CONTEUDO.lastUpdated = Date.now();
           
           console.log(`✅ Cache carregado do arquivo JSON: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
-          return; // ← Retorna aqui, não tenta buscar remotamente
+          return;
         } else {
           console.log('⚠️ Arquivo content.json está vazio');
         }
@@ -408,7 +535,113 @@ async function atualizarCache() {
       }
     } else {
       console.log('⚠️ Arquivo content.json não encontrado');
-      console.log('💡 Crie o arquivo content.json na raiz do projeto com o catálogo');
+    }
+    
+    // ===== 2. TENTAR VIA CLOUDFLARE WORKER =====
+    if (CLOUDFLARE_WORKER_URL) {
+      console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
+      
+      try {
+        const response = await axios.get(`${CLOUDFLARE_WORKER_URL}/proxy/app/_search.php?q=a`, {
+          timeout: 30000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+        
+        const cacheData = response.data;
+        let rawMovies = [], rawSeries = [];
+        
+        if (cacheData.data) {
+          rawMovies = cacheData.data.movies || [];
+          rawSeries = cacheData.data.series || [];
+        } else if (cacheData.movies) {
+          rawMovies = cacheData.movies;
+          rawSeries = cacheData.series;
+        }
+        
+        if (rawMovies.length > 0 || rawSeries.length > 0) {
+          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.lastUpdated = Date.now();
+          
+          console.log(`✅ Cache obtido via Cloudflare Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          
+          // Salvar em content.json para próximos deploys
+          try {
+            const dataToSave = {
+              status: true,
+              error: null,
+              data: {
+                movies: rawMovies,
+                series: rawSeries
+              },
+              lastUpdated: new Date().toISOString()
+            };
+            
+            fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
+            console.log('💾 Cache salvo em content.json para próximos deploys');
+          } catch (saveError) {
+            console.log('⚠️ Não foi possível salvar content.json:', saveError.message);
+          }
+          
+          return;
+        }
+      } catch (workerError) {
+        console.log('⚠️ Cloudflare Worker falhou:', workerError.message);
+      }
+    }
+    
+    // ===== 3. TENTAR VIA PUPPETEER (FALLBACK) =====
+    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
+      console.log('🤖 Tentando buscar cache via Puppeteer...');
+      
+      let cacheData = await buscarCacheComPuppeteer(COOKIES_PUPPETEER, BASE_URL);
+      
+      if (!cacheData && buscarCacheAlternativo) {
+        console.log('⚠️ Método padrão falhou, tentando método alternativo...');
+        cacheData = await buscarCacheAlternativo(COOKIES_PUPPETEER, BASE_URL);
+      }
+      
+      if (cacheData) {
+        let rawMovies = [], rawSeries = [];
+        
+        if (cacheData.data) {
+          rawMovies = cacheData.data.movies || [];
+          rawSeries = cacheData.data.series || [];
+        } else if (cacheData.movies) {
+          rawMovies = cacheData.movies;
+          rawSeries = cacheData.series;
+        }
+        
+        if (rawMovies.length > 0 || rawSeries.length > 0) {
+          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.lastUpdated = Date.now();
+          
+          console.log(`✅ Cache obtido via Puppeteer: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          
+          // Salvar em content.json
+          try {
+            const dataToSave = {
+              status: true,
+              error: null,
+              data: {
+                movies: rawMovies,
+                series: rawSeries
+              },
+              lastUpdated: new Date().toISOString()
+            };
+            
+            fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
+            console.log('💾 Cache salvo em content.json');
+          } catch (saveError) {
+            console.log('⚠️ Não foi possível salvar content.json');
+          }
+          
+          return;
+        }
+      }
     }
     
     console.error("⚠️ Cache não pôde ser carregado - sistema funcionará em modo limitado");
@@ -418,7 +651,7 @@ async function atualizarCache() {
   }
 }
 
-// ===== FUNÇÃO: CORRIGIR CARACTERES ESPECIAIS (HTML ENTITIES) =====
+// ===== FUNÇÃO: CORRIGIR CARACTERES ESPECIAIS =====
 
 function corrigirCaracteresEspeciais(html) {
   const entitiesMap = {
@@ -443,7 +676,7 @@ function corrigirCaracteresEspeciais(html) {
   return html;
 }
 
-// ===== FUNÇÃO: LIMPAR E CORRIGIR TEXTO =====
+// ===== FUNÇÃO: LIMPAR TEXTO =====
 
 function limparTexto(texto) {
   if (!texto) return '';
@@ -461,16 +694,8 @@ function limparTexto(texto) {
   const correcoes = {
     'Ã§': 'ç', 'Ã©': 'é', 'Ã¡': 'á', 'Ã£': 'ã', 'Ãµ': 'õ', 'Ã­': 'í',
     'Ã³': 'ó', 'Ãº': 'ú', 'Ã¢': 'â', 'Ãª': 'ê', 'Ã´': 'ô', 'Ã ': 'à',
-    'Ã‡': 'Ç', 'Ã‰': 'É', 'Ã': 'Á', 'Ãƒ': 'Ã', 'Ã': 'Õ', 'Ã': 'Í',
-    'Ã"': 'Ó', 'Ãš': 'Ú', 'Ã‚': 'Â', 'ÃŠ': 'Ê', 'Ã"': 'Ô', 'Ã€': 'À',
-    '?§': 'ç', '?©': 'é', '?¡': 'á', '?£': 'ã', '?µ': 'õ', '?­': 'í',
-    '?³': 'ó', '?º': 'ú', '?¢': 'â', '?ª': 'ê', '?´': 'ô', '? ': 'à',
-    'a??o': 'ação', 'A??o': 'Ação', 'A??ES': 'AÇÕES',
-    'fic??o': 'ficção', 'Fic??o': 'Ficção',
-    'avi?o': 'avião', 'Avi?o': 'Avião',
-    'televis?o': 'televisão', 'Televis?o': 'Televisão',
-    'miss?o': 'missão', 'Miss?o': 'Missão',
-    'cora??o': 'coração', 'Cora??o': 'Coração'
+    'a??o': 'ação', 'A??o': 'Ação',
+    'fic??o': 'ficção', 'miss?o': 'missão', 'cora??o': 'coração'
   };
   
   for (const [errado, certo] of Object.entries(correcoes)) {
@@ -480,12 +705,26 @@ function limparTexto(texto) {
   return texto;
 }
 
-// ===== BUSCAR DETALHES (COM PROXY) =====
+// ===== BUSCAR DETALHES (PUPPETEER PRIMEIRO, AXIOS FALLBACK) =====
 
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
   
   try {
+    // ===== TENTAR VIA PUPPETEER PRIMEIRO (SE TEM COOKIES) =====
+    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
+      console.log('🤖 Buscando detalhes via Puppeteer (sessão autenticada)...');
+      
+      const detalhes = await buscarDetalhesComPuppeteer(id, type, COOKIES_PUPPETEER, BASE_URL);
+      
+      if (detalhes) {
+        return detalhes;
+      } else {
+        console.log('⚠️ Puppeteer falhou, tentando Axios...');
+      }
+    }
+    
+    // ===== FALLBACK: VIA AXIOS (COM PROXY SE DISPONÍVEL) =====
     const axiosConfig = {
       params: { page: pageType, id },
       headers: HEADERS,
@@ -499,6 +738,7 @@ async function buscarDetalhes(id, type) {
         port: PROXY_FUNCIONANDO.port,
         protocol: 'http'
       };
+      console.log(`🌐 Usando proxy: ${PROXY_FUNCIONANDO.host}:${PROXY_FUNCIONANDO.port}`);
     }
     
     let response = await client.get(`${BASE_URL}/index.php`, axiosConfig);
@@ -928,23 +1168,6 @@ app.get('/player/:token', async (req, res) => {
             background-color: #E50914;
         }
         
-        .vjs-theme-fasttv .vjs-slider {
-            background-color: rgba(255,255,255,0.3);
-        }
-        
-        .vjs-theme-fasttv .vjs-load-progress {
-            background: rgba(255,255,255,0.2);
-        }
-        
-        .vjs-download-button,
-        .vjs-picture-in-picture-control {
-            display: none !important;
-        }
-        
-        .vjs-loading-spinner {
-            border-color: #E50914 transparent transparent transparent;
-        }
-        
         .info-bar {
             background: rgba(20,20,20,0.95);
             backdrop-filter: blur(10px);
@@ -967,36 +1190,6 @@ app.get('/player/:token', async (req, res) => {
         
         .meta span { display: flex; align-items: center; gap: 8px; }
         
-        .controls {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            justify-content: center;
-            margin-top: 20px;
-        }
-        
-        .btn {
-            background: linear-gradient(135deg, #E50914 0%, #B20710 100%);
-            color: #fff;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-size: 16px;
-            cursor: pointer;
-            transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            box-shadow: 0 4px 15px rgba(229, 9, 20, 0.3);
-        }
-        
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(229, 9, 20, 0.5);
-        }
-        
-        .btn.secondary { background: linear-gradient(135deg, #333 0%, #222 100%); }
-        
         .warning {
             text-align: center;
             margin-top: 20px;
@@ -1016,10 +1209,6 @@ app.get('/player/:token', async (req, res) => {
         }
         
         @media (max-width: 768px) {
-            .logo { font-size: 28px; }
-            .title { font-size: 20px; }
-            .controls { flex-direction: column; }
-            .btn { width: 100%; justify-content: center; }
             .video-js { height: 50vh; }
         }
     </style>
@@ -1037,19 +1226,10 @@ app.get('/player/:token', async (req, res) => {
                 data-setup='{
                     "fluid": true,
                     "aspectRatio": "16:9",
-                    "playbackRates": [0.5, 0.75, 1, 1.25, 1.5, 2],
-                    "controlBar": {
-                        "pictureInPictureToggle": false,
-                        "volumePanel": {
-                            "inline": false
-                        }
-                    }
+                    "playbackRates": [0.5, 0.75, 1, 1.25, 1.5, 2]
                 }'
             >
                 <source src="${streamPath}" type="video/mp4">
-                <p class="vjs-no-js">
-                    Para visualizar este vídeo, ative o JavaScript ou use um navegador que suporte HTML5.
-                </p>
             </video>
         </div>
         
@@ -1060,21 +1240,6 @@ app.get('/player/:token', async (req, res) => {
                 <span><i class="fas fa-calendar"></i> Comprado em ${new Date(purchase.purchaseDate).toLocaleDateString('pt-BR')}</span>
                 <span><i class="fas fa-clock"></i> Expira em <span class="timer" id="countdown"></span></span>
                 <span><i class="fas fa-eye"></i> ${purchase.viewCount} visualizaç${purchase.viewCount === 1 ? 'ão' : 'ões'}</span>
-            </div>
-            
-            <div class="controls">
-                <button class="btn" onclick="toggleFullscreen()">
-                    <i class="fas fa-expand"></i> Tela Cheia
-                </button>
-                <button class="btn secondary" onclick="setSpeed(1.5)">
-                    <i class="fas fa-forward"></i> 1.5x
-                </button>
-                <button class="btn secondary" onclick="setSpeed(1.0)">
-                    <i class="fas fa-play"></i> Normal
-                </button>
-                <button class="btn secondary" onclick="setSpeed(0.75)">
-                    <i class="fas fa-backward"></i> 0.75x
-                </button>
             </div>
         </div>
         
@@ -1096,24 +1261,6 @@ app.get('/player/:token', async (req, res) => {
             player.el().addEventListener('contextmenu', function(e) {
                 e.preventDefault();
                 return false;
-            });
-            
-            document.addEventListener('contextmenu', function(e) {
-                e.preventDefault();
-                return false;
-            });
-            
-            document.addEventListener('keydown', function(e) {
-                if (
-                    e.keyCode === 123 ||
-                    (e.ctrlKey && e.shiftKey && e.keyCode === 73) ||
-                    (e.ctrlKey && e.shiftKey && e.keyCode === 74) ||
-                    (e.ctrlKey && e.keyCode === 85) ||
-                    (e.ctrlKey && e.keyCode === 83)
-                ) {
-                    e.preventDefault();
-                    return false;
-                }
             });
             
             let playLogged = false;
@@ -1155,63 +1302,6 @@ app.get('/player/:token', async (req, res) => {
         
         updateCountdown();
         setInterval(updateCountdown, 60000);
-        
-        function toggleFullscreen() {
-            if (player) {
-                if (!player.isFullscreen()) {
-                    player.requestFullscreen();
-                } else {
-                    player.exitFullscreen();
-                }
-            }
-        }
-        
-        function setSpeed(speed) {
-            if (player) {
-                player.playbackRate(speed);
-            }
-        }
-        
-        document.addEventListener('keydown', function(e) {
-            if (!player) return;
-            
-            switch(e.code) {
-                case 'Space':
-                    e.preventDefault();
-                    if (player.paused()) {
-                        player.play();
-                    } else {
-                        player.pause();
-                    }
-                    break;
-                    
-                case 'ArrowRight':
-                    player.currentTime(player.currentTime() + 10);
-                    break;
-                    
-                case 'ArrowLeft':
-                    player.currentTime(player.currentTime() - 10);
-                    break;
-                    
-                case 'ArrowUp':
-                    e.preventDefault();
-                    player.volume(Math.min(1, player.volume() + 0.1));
-                    break;
-                    
-                case 'ArrowDown':
-                    e.preventDefault();
-                    player.volume(Math.max(0, player.volume() - 0.1));
-                    break;
-                    
-                case 'KeyF':
-                    toggleFullscreen();
-                    break;
-                    
-                case 'KeyM':
-                    player.muted(!player.muted());
-                    break;
-            }
-        });
     </script>
 </body>
 </html>
@@ -1372,93 +1462,19 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
   }
 });
 
-app.get('/api/admin/users', adminAuth, async (req, res) => {
+app.post('/api/admin/refresh-cache', adminAuth, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    
-    const users = await User.find()
-      .sort({ registeredAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    
-    const total = await User.countDocuments();
+    console.log('🔄 Recarregando cache manualmente...');
+    await atualizarCache();
     
     res.json({
-      users,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
+      success: true,
+      movies: CACHE_CONTEUDO.movies.length,
+      series: CACHE_CONTEUDO.series.length,
+      lastUpdated: CACHE_CONTEUDO.lastUpdated
     });
   } catch (error) {
-    console.error('Erro ao listar usuários:', error);
-    res.status(500).json({ error: 'Erro ao listar usuários' });
-  }
-});
-
-app.get('/api/admin/users/:userId', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findOne({ userId: parseInt(req.params.userId) });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Usuário não encontrado' });
-    }
-    
-    const purchases = await PurchasedContent.find({ userId: user.userId })
-      .sort({ purchaseDate: -1 })
-      .limit(10);
-    
-    res.json({ user, recentPurchases: purchases });
-  } catch (error) {
-    console.error('Erro ao buscar usuário:', error);
-    res.status(500).json({ error: 'Erro ao buscar usuário' });
-  }
-});
-
-app.put('/api/admin/users/:userId/credits', adminAuth, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const userId = parseInt(req.params.userId);
-    
-    const user = await User.findOne({ userId });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Usuário não encontrado' });
-    }
-    
-    user.credits += amount;
-    await user.save();
-    
-    res.json({ success: true, newBalance: user.credits });
-  } catch (error) {
-    console.error('Erro ao atualizar créditos:', error);
-    res.status(500).json({ error: 'Erro ao atualizar créditos' });
-  }
-});
-
-app.put('/api/admin/users/:userId/block', adminAuth, async (req, res) => {
-  try {
-    const { blocked, reason } = req.body;
-    const userId = parseInt(req.params.userId);
-    
-    const user = await User.findOne({ userId });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Usuário não encontrado' });
-    }
-    
-    user.isBlocked = blocked;
-    user.blockedReason = reason || null;
-    await user.save();
-    
-    res.json({ success: true, user });
-  } catch (error) {
-    console.error('Erro ao bloquear usuário:', error);
-    res.status(500).json({ error: 'Erro ao bloquear usuário' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -1566,7 +1582,7 @@ async function iniciarServidor() {
         console.error('💡 SOLUÇÕES:');
         console.error('  1. Verifique credenciais: LOGIN_USER e LOGIN_PASS');
         console.error('  2. Teste login manual em: http://vouver.me');
-        console.error('  3. Considere usar proxy se IP estiver bloqueado');
+        console.error('  3. Configure CLOUDFLARE_WORKER_URL');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         
         userSession.user = LOGIN_USER;
@@ -1587,11 +1603,11 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - Versão Final Completa!');
+      console.log('🚀 FastTV Server - Versão Final com Cloudflare Worker!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌐 URLs Relativas: Compatível com qualquer domínio`);
+      console.log(`☁️ Cloudflare Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo ✅' : 'Inativo ⚠️'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
       console.log(`📝 Encoding: UTF-8 corrigido (200+ padrões)`);
@@ -1602,7 +1618,6 @@ async function iniciarServidor() {
       console.log('='.repeat(60) + '\n');
     });
 
-    // Atualizar cache a cada 6 horas
     setInterval(async () => {
       console.log('🔄 Atualização automática do cache (6h)...');
       await atualizarCache();
@@ -1614,8 +1629,6 @@ async function iniciarServidor() {
   }
 }
 
-// ===== TRATAMENTO DE ERROS GLOBAIS =====
-
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection:', reason);
 });
@@ -1624,7 +1637,5 @@ process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
   process.exit(1);
 });
-
-// ===== INICIAR SERVIDOR =====
 
 iniciarServidor();
