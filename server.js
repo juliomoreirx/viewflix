@@ -1812,6 +1812,7 @@ async function iniciarServidor() {
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
+      console.log(`🌐 URLs Relativas: Compatível com qualquer domínio`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
       console.log(`📝 Encoding: UTF-8 corrigido (200+ padrões)`);
