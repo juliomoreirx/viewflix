@@ -12,10 +12,12 @@ const iconv = require('iconv-lite');
 const { CookieJar } = require('tough-cookie');
 const { wrapper } = require('axios-cookiejar-support');
 const mongoose = require('mongoose');
-const cloudscraper = require('cloudscraper');
 
 // ===== IMPORTA BOT DO TELEGRAM =====
 const telegramBot = require('./telegram-bot');
+
+// ===== IMPORTA LOGIN COM PUPPETEER =====
+const { fazerLoginComPuppeteer } = require('./vouver-puppeteer');
 
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
 const DOMINIO_PUBLICO = process.env.DOMINIO_PUBLICO || 'http://localhost:3000';
@@ -144,21 +146,10 @@ const rateLimitSchema = new mongoose.Schema({
 
 const RateLimit = mongoose.model('RateLimit', rateLimitSchema);
 
-// ===== EXPRESS + AXIOS + CLOUDSCRAPER =====
+// ===== EXPRESS + AXIOS =====
 const app = express();
 const jar = new CookieJar();
 const client = wrapper(axios.create({ jar }));
-
-// Cliente Cloudscraper para bypassar Cloudflare
-const cloudscraperJar = new CookieJar();
-const cloudscraperClient = cloudscraper.defaults({
-  jar: cloudscraperJar,
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  }
-});
-
-console.log('✅ Cloudscraper configurado (bypass Cloudflare)');
 
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -174,6 +165,7 @@ app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 // ===== ESTADO GLOBAL =====
 let userSession = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
+let PROXY_FUNCIONANDO = null; // ← Proxy que funcionou no login
 
 // ===== FUNÇÕES DE SEGURANÇA =====
 
@@ -306,12 +298,10 @@ function strictCORS(req, res, next) {
   next();
 }
 
-// ===== FUNÇÕES DE LOGIN E CACHE COM CLOUDSCRAPER =====
-
-const { fazerLoginComPuppeteer } = require('./vouver-puppeteer');
+// ===== FUNÇÃO DE LOGIN COM PUPPETEER =====
 
 async function fazerLoginVouver(username, password, tentativa = 1) {
-  const MAX_TENTATIVAS = 2; // Reduz tentativas com Puppeteer
+  const MAX_TENTATIVAS = 2;
   
   if (tentativa > MAX_TENTATIVAS) {
     console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas de login`);
@@ -341,6 +331,16 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       userSession.user = username;
       userSession.pass = password;
       
+      // ===== SALVAR PROXY QUE FUNCIONOU =====
+      if (result.proxy) {
+        const [host, port] = result.proxy.split(':');
+        PROXY_FUNCIONANDO = {
+          host: host,
+          port: parseInt(port)
+        };
+        console.log(`💾 Proxy salva para uso futuro: ${result.proxy}`);
+      }
+      
       console.log('✅ Login no Vouver realizado com sucesso!');
       console.log('✅ Cookies transferidos para axios');
       
@@ -362,14 +362,31 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
+// ===== FUNÇÃO: ATUALIZAR CACHE (COM PROXY) =====
+
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, { 
+    // Configurar axios com proxy se disponível
+    const axiosConfig = {
       headers: HEADERS,
       timeout: 30000
-    });
+    };
+    
+    // Se tem proxy que funcionou, usar ela
+    if (PROXY_FUNCIONANDO) {
+      axiosConfig.proxy = {
+        host: PROXY_FUNCIONANDO.host,
+        port: PROXY_FUNCIONANDO.port,
+        protocol: 'http'
+      };
+      console.log(`🌐 Usando proxy salva: ${PROXY_FUNCIONANDO.host}:${PROXY_FUNCIONANDO.port}`);
+    } else {
+      console.log('⚠️ Sem proxy salva, tentando sem proxy...');
+    }
+    
+    const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, axiosConfig);
     
     const data = response.data;
     let rawMovies = [], rawSeries = [];
@@ -389,6 +406,38 @@ async function atualizarCache() {
     console.log(`✅ Cache atualizado: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
   } catch (error) {
     console.error("❌ Erro ao atualizar cache:", error.message);
+    
+    // Se falhou com proxy, tentar sem (fallback)
+    if (PROXY_FUNCIONANDO) {
+      console.log('⚠️ Erro com proxy, tentando sem proxy como fallback...');
+      
+      try {
+        const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, { 
+          headers: HEADERS,
+          timeout: 30000
+        });
+        
+        const data = response.data;
+        let rawMovies = [], rawSeries = [];
+        
+        if (data.data) {
+          rawMovies = data.data.movies || [];
+          rawSeries = data.data.series || [];
+        } else if (data.movies) {
+          rawMovies = data.movies;
+          rawSeries = data.series;
+        }
+        
+        CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+        CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+        CACHE_CONTEUDO.lastUpdated = Date.now();
+        
+        console.log(`✅ Cache atualizado (sem proxy): ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+        
+      } catch (fallbackError) {
+        console.error("❌ Erro mesmo sem proxy:", fallbackError.message);
+      }
+    }
   }
 }
 
@@ -516,18 +565,29 @@ function limparTexto(texto) {
   return texto;
 }
 
-// ===== BUSCAR DETALHES COM CLOUDSCRAPER =====
+// ===== BUSCAR DETALHES (COM PROXY) =====
 
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
   
   try {
-    let response = await client.get(`${BASE_URL}/index.php`, {
+    // Configurar axios com proxy se disponível
+    const axiosConfig = {
       params: { page: pageType, id },
       headers: HEADERS,
       timeout: 15000,
       responseType: 'arraybuffer'
-    });
+    };
+    
+    if (PROXY_FUNCIONANDO) {
+      axiosConfig.proxy = {
+        host: PROXY_FUNCIONANDO.host,
+        port: PROXY_FUNCIONANDO.port,
+        protocol: 'http'
+      };
+    }
+    
+    let response = await client.get(`${BASE_URL}/index.php`, axiosConfig);
     
     let html = null;
     const encodings = ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1'];
@@ -553,12 +613,22 @@ async function buscarDetalhes(id, type) {
     let $ = cheerio.load(html, { decodeEntities: false });
 
     if ($('.tab_episode').length === 0 && type !== 'movies') {
-      response = await client.get(`${BASE_URL}/index.php`, {
+      const axiosConfig2 = {
         params: { page: 'moviedetail', id },
         headers: HEADERS,
         timeout: 15000,
         responseType: 'arraybuffer'
-      });
+      };
+      
+      if (PROXY_FUNCIONANDO) {
+        axiosConfig2.proxy = {
+          host: PROXY_FUNCIONANDO.host,
+          port: PROXY_FUNCIONANDO.port,
+          protocol: 'http'
+        };
+      }
+      
+      response = await client.get(`${BASE_URL}/index.php`, axiosConfig2);
       
       html = null;
       for (const encoding of encodings) {
