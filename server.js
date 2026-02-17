@@ -16,8 +16,8 @@ const mongoose = require('mongoose');
 // ===== IMPORTA BOT DO TELEGRAM =====
 const telegramBot = require('./telegram-bot');
 
-// ===== IMPORTA LOGIN COM PUPPETEER =====
-const { fazerLoginComPuppeteer } = require('./vouver-puppeteer');
+// ===== IMPORTA LOGIN E CACHE COM PUPPETEER =====
+const { fazerLoginComPuppeteer, buscarCacheComPuppeteer } = require('./vouver-puppeteer');
 
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
 const DOMINIO_PUBLICO = process.env.DOMINIO_PUBLICO || 'http://localhost:3000';
@@ -165,7 +165,8 @@ app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 // ===== ESTADO GLOBAL =====
 let userSession = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
-let PROXY_FUNCIONANDO = null; // ← Proxy que funcionou no login
+let PROXY_FUNCIONANDO = null; // Proxy que funcionou no login
+let COOKIES_PUPPETEER = null; // Cookies do Puppeteer para reutilizar
 
 // ===== FUNÇÕES DE SEGURANÇA =====
 
@@ -341,6 +342,10 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         console.log(`💾 Proxy salva para uso futuro: ${result.proxy}`);
       }
       
+      // ===== SALVAR COOKIES DO PUPPETEER =====
+      COOKIES_PUPPETEER = result.cookies;
+      console.log(`💾 ${result.cookies.length} cookies do Puppeteer salvos para cache`);
+      
       console.log('✅ Login no Vouver realizado com sucesso!');
       console.log('✅ Cookies transferidos para axios');
       
@@ -362,19 +367,52 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
-// ===== FUNÇÃO: ATUALIZAR CACHE (COM PROXY) =====
+// ===== FUNÇÃO: ATUALIZAR CACHE (VIA PUPPETEER PRIMEIRO) =====
 
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    // Configurar axios com proxy se disponível
+    // ===== ESTRATÉGIA 1: VIA PUPPETEER (MAIS CONFIÁVEL) =====
+    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
+      console.log('🤖 Tentando atualizar cache via Puppeteer (mesma sessão do login)...');
+      
+      const cacheData = await buscarCacheComPuppeteer(COOKIES_PUPPETEER, BASE_URL);
+      
+      if (cacheData) {
+        let rawMovies = [], rawSeries = [];
+        
+        if (cacheData.data) {
+          rawMovies = cacheData.data.movies || [];
+          rawSeries = cacheData.data.series || [];
+        } else if (cacheData.movies) {
+          rawMovies = cacheData.movies;
+          rawSeries = cacheData.series;
+        }
+        
+        if (rawMovies.length > 0 || rawSeries.length > 0) {
+          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.lastUpdated = Date.now();
+          
+          console.log(`✅ Cache atualizado via Puppeteer: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          return;
+        } else {
+          console.log('⚠️ Puppeteer retornou dados vazios, tentando fallback...');
+        }
+      } else {
+        console.log('⚠️ Puppeteer falhou, tentando fallback...');
+      }
+    }
+    
+    // ===== ESTRATÉGIA 2: VIA AXIOS COM PROXY =====
+    console.log('⚠️ Tentando via axios como fallback...');
+    
     const axiosConfig = {
       headers: HEADERS,
       timeout: 30000
     };
     
-    // Se tem proxy que funcionou, usar ela
     if (PROXY_FUNCIONANDO) {
       axiosConfig.proxy = {
         host: PROXY_FUNCIONANDO.host,
@@ -382,8 +420,6 @@ async function atualizarCache() {
         protocol: 'http'
       };
       console.log(`🌐 Usando proxy salva: ${PROXY_FUNCIONANDO.host}:${PROXY_FUNCIONANDO.port}`);
-    } else {
-      console.log('⚠️ Sem proxy salva, tentando sem proxy...');
     }
     
     const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, axiosConfig);
@@ -403,13 +439,14 @@ async function atualizarCache() {
     CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
     CACHE_CONTEUDO.lastUpdated = Date.now();
     
-    console.log(`✅ Cache atualizado: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+    console.log(`✅ Cache atualizado via axios: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+    
   } catch (error) {
     console.error("❌ Erro ao atualizar cache:", error.message);
     
-    // Se falhou com proxy, tentar sem (fallback)
+    // ===== ESTRATÉGIA 3: VIA AXIOS SEM PROXY =====
     if (PROXY_FUNCIONANDO) {
-      console.log('⚠️ Erro com proxy, tentando sem proxy como fallback...');
+      console.log('⚠️ Tentando sem proxy...');
       
       try {
         const response = await client.get(`${BASE_URL}/app/_search.php?q=a`, { 
@@ -436,6 +473,7 @@ async function atualizarCache() {
         
       } catch (fallbackError) {
         console.error("❌ Erro mesmo sem proxy:", fallbackError.message);
+        console.error("⚠️ Cache permanece vazio - sistema funcionará em modo limitado");
       }
     }
   }
@@ -493,69 +531,7 @@ function limparTexto(texto) {
     'avi?o': 'avião', 'Avi?o': 'Avião',
     'televis?o': 'televisão', 'Televis?o': 'Televisão',
     'miss?o': 'missão', 'Miss?o': 'Missão',
-    'cora??o': 'coração', 'Cora??o': 'Coração',
-    'tradi??o': 'tradição', 'Tradi??o': 'Tradição',
-    'inten??o': 'intenção', 'Inten??o': 'Intenção',
-    'aten??o': 'atenção', 'Aten??o': 'Atenção',
-    'condi??o': 'condição', 'Condi??o': 'Condição',
-    'pris?o': 'prisão', 'Pris?o': 'Prisão',
-    'reuni?o': 'reunião', 'Reuni?o': 'Reunião',
-    'decis?o': 'decisão', 'Decis?o': 'Decisão',
-    'vers?o': 'versão', 'Vers?o': 'Versão',
-    'dimens?o': 'dimensão', 'Dimens?o': 'Dimensão',
-    'pens?o': 'pensão', 'Pens?o': 'Pensão',
-    'tens?o': 'tensão', 'Tens?o': 'Tensão',
-    'extens?o': 'extensão', 'Extens?o': 'Extensão',
-    'compaix?o': 'compaixão', 'Compaix?o': 'Compaixão',
-    'rela??o': 'relação', 'Rela??o': 'Relação',
-    'rela??es': 'relações', 'Rela??es': 'Relações',
-    'educa??o': 'educação', 'Educa??o': 'Educação',
-    'polui??o': 'poluição', 'Polui??o': 'Poluição',
-    'produ??o': 'produção', 'Produ??o': 'Produção',
-    'intui??o': 'intuição', 'Intui??o': 'Intuição',
-    'profu?o': 'profusão', 'Profu?o': 'Profusão',
-    'extin??o': 'extinção', 'Extin??o': 'Extinção',
-    '? ': 'é ', '?s': 'és',
-    'constr?i': 'constrói', 'Constr?i': 'Constrói',
-    'bilion?rio': 'bilionário', 'Bilion?rio': 'Bilionário',
-    'milion?rio': 'milionário', 'Milion?rio': 'Milionário',
-    'ordin?rio': 'ordinário', 'Ordin?rio': 'Ordinário',
-    'necess?rio': 'necessário', 'Necess?rio': 'Necessário',
-    'tempor?rio': 'temporário', 'Tempor?rio': 'Temporário',
-    'prim?rio': 'primário', 'Prim?rio': 'Primário',
-    'secret?rio': 'secretário', 'Secret?rio': 'Secretário',
-    'advers?rio': 'adversário', 'Advers?rio': 'Adversário',
-    'question?rio': 'questionário', 'Question?rio': 'Questionário',
-    'liter?rio': 'literário', 'Liter?rio': 'Literário',
-    'monet?rio': 'monetário', 'Monet?rio': 'Monetário',
-    'sanit?rio': 'sanitário', 'Sanit?rio': 'Sanitário',
-    'solid?rio': 'solidário', 'Solid?rio': 'Solidário',
-    'volunt?rio': 'voluntário', 'Volunt?rio': 'Voluntário',
-    'Bras?lia': 'Brasília',
-    'fam?lia': 'família', 'Fam?lia': 'Família',
-    'hist?ria': 'história', 'Hist?ria': 'História',
-    'mem?ria': 'memória', 'Mem?ria': 'Memória',
-    'gl?ria': 'glória', 'Gl?ria': 'Glória',
-    'vit?ria': 'vitória', 'Vit?ria': 'Vitória',
-    'territ?rio': 'território', 'Territ?rio': 'Território',
-    'coment?rio': 'comentário', 'Coment?rio': 'Comentário',
-    'relat?rio': 'relatório', 'Relat?rio': 'Relatório',
-    'observat?rio': 'observatório', 'Observat?rio': 'Observatório',
-    'audit?rio': 'auditório', 'Audit?rio': 'Auditório',
-    'laborat?rio': 'laboratório', 'Laborat?rio': 'Laboratório',
-    'inv?s': 'invés', 'Inv?s': 'Invés',
-    'atrav?s': 'através', 'Atrav?s': 'Através',
-    'portugu?s': 'português', 'Portugu?s': 'Português',
-    'ingl?s': 'inglês', 'Ingl?s': 'Inglês',
-    'franc?s': 'francês', 'Franc?s': 'Francês',
-    'japon?s': 'japonês', 'Japon?s': 'Japonês',
-    'chin?s': 'chinês', 'Chin?s': 'Chinês',
-    'tamb?m': 'também', 'Tamb?m': 'Também',
-    'ningu?m': 'ninguém', 'Ningu?m': 'Ninguém',
-    'algu?m': 'alguém', 'Algu?m': 'Alguém',
-    'por?m': 'porém', 'Por?m': 'Porém',
-    'al?m': 'além', 'Al?m': 'Além',
-    'cient?fica': 'científica', 'Cient?fica': 'Científica'
+    'cora??o': 'coração', 'Cora??o': 'Coração'
   };
   
   for (const [errado, certo] of Object.entries(correcoes)) {
@@ -571,7 +547,6 @@ async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
   
   try {
-    // Configurar axios com proxy se disponível
     const axiosConfig = {
       params: { page: pageType, id },
       headers: HEADERS,
@@ -725,7 +700,7 @@ async function buscarDetalhes(id, type) {
   }
 }
 
-// ===== ESTIMAR DURAÇÃO: FILMES (HTML) vs EPISÓDIOS (ESTIMATIVA) =====
+// ===== ESTIMAR DURAÇÃO =====
 
 async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
   try {
@@ -784,46 +759,11 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
           { upsert: true, new: true }
         );
         
-        console.log(`✅ [${mediaType.toUpperCase()}] Duração via HEAD: ${duracaoFinal}min (${(contentLength / (1024 * 1024)).toFixed(2)} MB)`);
+        console.log(`✅ [${mediaType.toUpperCase()}] Duração via HEAD: ${duracaoFinal}min`);
         return duracaoFinal;
       }
     } catch (headError) {
       console.log(`⚠️ [${mediaType.toUpperCase()}] HEAD falhou: ${headError.message}`);
-    }
-    
-    try {
-      const rangeResponse = await axios.get(url, {
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Referer': BASE_URL,
-          'Accept': '*/*',
-          'Range': 'bytes=0-0'
-        },
-        timeout: 10000,
-        maxRedirects: 5,
-        validateStatus: (status) => status === 206 || status === 200 || status === 416
-      });
-      
-      const contentRange = rangeResponse.headers['content-range'];
-      if (contentRange) {
-        const match = contentRange.match(/bytes \d+-\d+\/(\d+)/);
-        if (match) {
-          const totalSize = parseInt(match[1]);
-          const minutos = Math.round(totalSize / (1024 * 1024 * 15));
-          const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
-          
-          await AssetSize.findOneAndUpdate(
-            { assetId: id, mediaType: mediaType === 'movie' ? 'movie' : 'series_ep' },
-            { bytes: totalSize, updatedAt: new Date() },
-            { upsert: true, new: true }
-          );
-          
-          console.log(`✅ [${mediaType.toUpperCase()}] Duração via Range: ${duracaoFinal}min`);
-          return duracaoFinal;
-        }
-      }
-    } catch (rangeError) {
-      console.log(`⚠️ [${mediaType.toUpperCase()}] Range falhou: ${rangeError.message}`);
     }
     
     const duracaoPadrao = mediaType === 'movie' ? 110 : 42;
@@ -1212,13 +1152,7 @@ app.get('/player/:token', async (req, res) => {
         let player;
         
         document.addEventListener('DOMContentLoaded', function() {
-            player = videojs('player', {
-                controls: true,
-                autoplay: false,
-                preload: 'auto',
-                fluid: true,
-                responsive: true
-            });
+            player = videojs('player');
             
             player.el().addEventListener('contextmenu', function(e) {
                 e.preventDefault();
@@ -1243,20 +1177,6 @@ app.get('/player/:token', async (req, res) => {
                 }
             });
             
-            (function() {
-                const threshold = 160;
-                setInterval(function() {
-                    if (window.outerWidth - window.innerWidth > threshold ||
-                        window.outerHeight - window.innerHeight > threshold) {
-                        document.body.innerHTML = '<div style="color:#fff;text-align:center;padding:50px;"><h1>⚠️ Acesso Negado</h1><p>DevTools detectado.</p></div>';
-                        if (player) {
-                            player.pause();
-                            player.dispose();
-                        }
-                    }
-                }, 1000);
-            })();
-            
             let playLogged = false;
             player.on('play', function() {
                 if (!playLogged) {
@@ -1272,11 +1192,6 @@ app.get('/player/:token', async (req, res) => {
                     });
                     playLogged = true;
                 }
-            });
-            
-            player.on('enterpictureinpicture', function(e) {
-                e.preventDefault();
-                document.exitPictureInPicture().catch(() => {});
             });
         });
         
@@ -1485,6 +1400,39 @@ function adminAuth(req, res, next) {
   next();
 }
 
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  try {
+    const stats = {
+      users: {
+        total: await User.countDocuments(),
+        active: await User.countDocuments({ isActive: true, isBlocked: false }),
+        blocked: await User.countDocuments({ isBlocked: true })
+      },
+      purchases: {
+        total: (await User.aggregate([
+          { $group: { _id: null, total: { $sum: '$totalPurchases' } } }
+        ]))[0]?.total || 0,
+        revenue: (await User.aggregate([
+          { $group: { _id: null, total: { $sum: '$totalSpent' } } }
+        ]))[0]?.total || 0
+      },
+      content: {
+        active: await PurchasedContent.countDocuments({ expiresAt: { $gt: new Date() } }),
+        expired: await PurchasedContent.countDocuments({ expiresAt: { $lte: new Date() } })
+      },
+      catalog: {
+        movies: CACHE_CONTEUDO.movies.length,
+        series: CACHE_CONTEUDO.series.length
+      }
+    };
+    
+    res.json(stats);
+  } catch (error) {
+    console.error('Erro ao buscar estatísticas:', error);
+    res.status(500).json({ error: 'Erro ao buscar estatísticas' });
+  }
+});
+
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -1572,39 +1520,6 @@ app.put('/api/admin/users/:userId/block', adminAuth, async (req, res) => {
   } catch (error) {
     console.error('Erro ao bloquear usuário:', error);
     res.status(500).json({ error: 'Erro ao bloquear usuário' });
-  }
-});
-
-app.get('/api/admin/stats', adminAuth, async (req, res) => {
-  try {
-    const stats = {
-      users: {
-        total: await User.countDocuments(),
-        active: await User.countDocuments({ isActive: true, isBlocked: false }),
-        blocked: await User.countDocuments({ isBlocked: true })
-      },
-      purchases: {
-        total: (await User.aggregate([
-          { $group: { _id: null, total: { $sum: '$totalPurchases' } } }
-        ]))[0]?.total || 0,
-        revenue: (await User.aggregate([
-          { $group: { _id: null, total: { $sum: '$totalSpent' } } }
-        ]))[0]?.total || 0
-      },
-      content: {
-        active: await PurchasedContent.countDocuments({ expiresAt: { $gt: new Date() } }),
-        expired: await PurchasedContent.countDocuments({ expiresAt: { $lte: new Date() } })
-      },
-      catalog: {
-        movies: CACHE_CONTEUDO.movies.length,
-        series: CACHE_CONTEUDO.series.length
-      }
-    };
-    
-    res.json(stats);
-  } catch (error) {
-    console.error('Erro ao buscar estatísticas:', error);
-    res.status(500).json({ error: 'Erro ao buscar estatísticas' });
   }
 });
 
@@ -1748,7 +1663,9 @@ async function iniciarServidor() {
       console.log('='.repeat(60) + '\n');
     });
 
+    // Atualizar cache a cada 6 horas
     setInterval(async () => {
+      console.log('🔄 Atualização automática do cache (6h)...');
       await atualizarCache();
     }, 6 * 60 * 60 * 1000);
 
@@ -1758,6 +1675,8 @@ async function iniciarServidor() {
   }
 }
 
+// ===== TRATAMENTO DE ERROS GLOBAIS =====
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection:', reason);
 });
@@ -1766,5 +1685,7 @@ process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
   process.exit(1);
 });
+
+// ===== INICIAR SERVIDOR =====
 
 iniciarServidor();

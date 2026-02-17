@@ -4,9 +4,10 @@ const { obterProxiesValidas } = require('./proxy-scraper');
 const fs = require('fs');
 const path = require('path');
 
+// Usar plugin stealth (anti-detecção)
 puppeteer.use(StealthPlugin());
 
-// Cache de proxies
+// Cache de proxies (evita buscar toda vez)
 let PROXIES_CACHE = null;
 let CACHE_TIMESTAMP = 0;
 const CACHE_DURATION = 30 * 60 * 1000; // 30 minutos
@@ -14,12 +15,14 @@ const CACHE_DURATION = 30 * 60 * 1000; // 30 minutos
 async function obterProxies() {
   const agora = Date.now();
   
+  // Se tem cache válido (menos de 30 min), usa
   if (PROXIES_CACHE && (agora - CACHE_TIMESTAMP) < CACHE_DURATION) {
     console.log('✅ Usando proxies do cache (válidas por mais ' + 
                 Math.round((CACHE_DURATION - (agora - CACHE_TIMESTAMP)) / 60000) + ' minutos)');
     return PROXIES_CACHE;
   }
   
+  // Buscar proxies novas
   console.log('🔄 Cache expirado ou primeiro uso, buscando proxies novas...\n');
   const proxiesNovas = await obterProxiesValidas();
   
@@ -29,11 +32,13 @@ async function obterProxies() {
     return proxiesNovas;
   }
   
+  // Se não achou nenhuma, usa cache antigo (se tiver)
   if (PROXIES_CACHE) {
     console.log('⚠️ Nenhuma proxy nova, usando cache antigo');
     return PROXIES_CACHE;
   }
   
+  // Sem cache e sem proxies novas = erro
   throw new Error('Nenhuma proxy disponível');
 }
 
@@ -78,6 +83,7 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
   let page;
   
   try {
+    // Obter proxies dinâmicas
     const proxies = await obterProxies();
     
     if (proxies.length === 0) {
@@ -86,7 +92,7 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
     
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`🌐 ${proxies.length} proxies disponíveis para tentar`);
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━���━━━━━━\n');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
     
     // TENTAR TODAS AS PROXIES
     for (let i = 0; i < proxies.length; i++) {
@@ -121,6 +127,8 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
         console.log('✅ Navegador iniciado');
         
         page = await browser.newPage();
+        
+        // SEM autenticação (proxies grátis não precisam)
         
         page.setDefaultTimeout(45000);
         page.setDefaultNavigationTimeout(45000);
@@ -389,4 +397,90 @@ async function fazerLoginComPuppeteer(username, password, baseUrl) {
   }
 }
 
-module.exports = { fazerLoginComPuppeteer };
+// ===== FUNÇÃO: BUSCAR CACHE COM PUPPETEER =====
+
+async function buscarCacheComPuppeteer(cookies, baseUrl) {
+  let browser;
+  let page;
+  
+  try {
+    console.log('🔄 Buscando cache via Puppeteer (mesma sessão do login)...');
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ],
+      timeout: 60000
+    });
+    
+    page = await browser.newPage();
+    
+    // Setar os mesmos cookies do login
+    await page.setCookie(...cookies);
+    
+    console.log('✅ Cookies do login aplicados');
+    
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Buscar cache
+    await page.goto(`${baseUrl}/app/_search.php?q=a`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+    
+    console.log('✅ Página de cache acessada');
+    
+    // Extrair JSON da página
+    const cacheData = await page.evaluate(() => {
+      try {
+        const bodyText = document.body.innerText;
+        return JSON.parse(bodyText);
+      } catch (e) {
+        console.log('Erro ao parsear JSON:', e.message);
+        return null;
+      }
+    });
+    
+    await browser.close();
+    
+    if (cacheData) {
+      console.log('✅ Cache obtido via Puppeteer');
+      
+      // Log de quantos itens foram obtidos
+      let totalMovies = 0;
+      let totalSeries = 0;
+      
+      if (cacheData.data) {
+        totalMovies = (cacheData.data.movies || []).length;
+        totalSeries = (cacheData.data.series || []).length;
+      } else if (cacheData.movies) {
+        totalMovies = (cacheData.movies || []).length;
+        totalSeries = (cacheData.series || []).length;
+      }
+      
+      console.log(`📊 Cache: ${totalMovies} filmes | ${totalSeries} séries`);
+      
+      return cacheData;
+    } else {
+      console.log('⚠️ Resposta do cache não é JSON válido');
+      return null;
+    }
+    
+  } catch (error) {
+    console.error('❌ Erro ao buscar cache via Puppeteer:', error.message);
+    
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {}
+    }
+    
+    return null;
+  }
+}
+
+module.exports = { fazerLoginComPuppeteer, buscarCacheComPuppeteer };
