@@ -12,7 +12,6 @@ const iconv = require('iconv-lite');
 const { CookieJar } = require('tough-cookie');
 const { wrapper } = require('axios-cookiejar-support');
 const mongoose = require('mongoose');
-const cloudscraper = require('cloudscraper');
 
 // ===== IMPORTA BOT DO TELEGRAM =====
 const telegramBot = require('./telegram-bot');
