@@ -54,7 +54,7 @@ if (!MP_ACCESS_TOKEN) {
 }
 
 // ===== LOGS DE INICIALIZAÇÃO =====
-console.log('✅ Variáveis de ambiente carregadas com sucesso');
+console.log('✅ [Bot] Variáveis de ambiente carregadas');
 console.log(`🌐 Domínio: ${DOMINIO_PUBLICO}`);
 console.log(`🚪 Porta: ${PORT}`);
 console.log(`👤 Usuário Vouver: ${LOGIN_USER}`);
@@ -296,31 +296,214 @@ function strictCORS(req, res, next) {
 
 // ===== FUNÇÕES DE LOGIN E CACHE =====
 
-async function fazerLoginVouver(username, password) {
-  const params = new URLSearchParams();
-  params.append('username', username);
-  params.append('sifre', password);
-  params.append('beni_hatirla', 'on');
-  params.append('recaptcha_response', '');
-  params.append('login', 'Acessar');
-
+async function fazerLoginVouver(username, password, tentativa = 1) {
+  const MAX_TENTATIVAS = 3;
+  
+  if (tentativa > MAX_TENTATIVAS) {
+    console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas de login`);
+    return false;
+  }
+  
+  if (tentativa > 1) {
+    const delay = tentativa * 2000; // 2s, 4s, 6s
+    console.log(`⏳ Aguardando ${delay/1000}s antes da tentativa ${tentativa}...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
+  console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
+  console.log(`👤 Usuário: ${username}`);
+  
   try {
-    await client.post(`${BASE_URL}/index.php?page=login`, params, { headers: HEADERS });
-    const cookies = await jar.getCookies(BASE_URL);
+    // ===== ESTRATÉGIA 1: GET na página de login primeiro (coletar cookies) =====
+    console.log('📡 Passo 1: Acessando página de login...');
     
-    if (cookies.some(c => c.key === 'vouverme')) {
+    try {
+      await client.get(`${BASE_URL}/index.php?page=login`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Accept-Encoding': 'gzip, deflate',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'max-age=0',
+          'DNT': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1'
+        },
+        timeout: 15000,
+        maxRedirects: 5
+      });
+      
+      console.log('✅ Página de login acessada');
+      
+      const cookiesIniciais = await jar.getCookies(BASE_URL);
+      console.log(`🍪 Cookies iniciais: ${cookiesIniciais.length}`);
+      
+    } catch (error) {
+      console.warn('⚠️ Erro ao acessar página de login:', error.message);
+    }
+    
+    // Aguarda 1 segundo (comportamento humano)
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // ===== ESTRATÉGIA 2: POST do login com headers completos =====
+    console.log('📡 Passo 2: Enviando credenciais...');
+    
+    const formData = new URLSearchParams();
+    formData.append('username', username);
+    formData.append('sifre', password);
+    formData.append('beni_hatirla', 'on');
+    formData.append('recaptcha_response', '');
+    formData.append('login', 'Acessar');
+    
+    const loginResponse = await client.post(
+      `${BASE_URL}/index.php?page=login`,
+      formData.toString(),
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Accept-Encoding': 'gzip, deflate',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': BASE_URL,
+          'Referer': `${BASE_URL}/index.php?page=login`,
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'max-age=0',
+          'DNT': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-User': '?1',
+          'Sec-CH-UA': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+          'Sec-CH-UA-Mobile': '?0',
+          'Sec-CH-UA-Platform': '"Windows"'
+        },
+        timeout: 20000,
+        maxRedirects: 5,
+        validateStatus: (status) => status >= 200 && status < 400
+      }
+    );
+    
+    console.log(`📊 Status da resposta: ${loginResponse.status}`);
+    
+    // ===== VERIFICAR COOKIES =====
+    const cookies = await jar.getCookies(BASE_URL);
+    console.log(`🍪 Total de cookies após login: ${cookies.length}`);
+    
+    cookies.forEach(cookie => {
+      console.log(`   🍪 ${cookie.key} = ${cookie.value.substring(0, 20)}...`);
+    });
+    
+    // Verificar se tem cookie de sessão
+    const temCookieValido = cookies.some(c => 
+      c.key === 'vouverme' || 
+      c.key.toLowerCase().includes('session') ||
+      c.key.toLowerCase().includes('phpsessid') ||
+      c.key.toLowerCase().includes('auth')
+    );
+    
+    if (temCookieValido) {
       userSession.user = username;
       userSession.pass = password;
+      
       console.log('✅ Login no Vouver realizado com sucesso!');
+      console.log(`✅ Sessão estabelecida`);
+      
       await atualizarCache();
       return true;
     }
     
-    console.error('❌ Login no Vouver falhou - cookie não encontrado');
-    return false;
+    // ===== VERIFICAR REDIRECIONAMENTO =====
+    const finalUrl = loginResponse.request?.res?.responseUrl || loginResponse.config.url;
+    console.log(`📍 URL final: ${finalUrl}`);
+    
+    if (finalUrl && !finalUrl.includes('page=login')) {
+      userSession.user = username;
+      userSession.pass = password;
+      
+      console.log('✅ Login realizado (redirecionamento detectado)');
+      await atualizarCache();
+      return true;
+    }
+    
+    // ===== VERIFICAR CONTEÚDO DA RESPOSTA =====
+    const responseText = loginResponse.data.toString().substring(0, 500);
+    
+    if (responseText.includes('logout') || 
+        responseText.includes('sair') || 
+        responseText.includes('dashboard') ||
+        responseText.includes('perfil')) {
+      
+      userSession.user = username;
+      userSession.pass = password;
+      
+      console.log('✅ Login realizado (conteúdo autenticado detectado)');
+      await atualizarCache();
+      return true;
+    }
+    
+    // ===== NENHUM INDICADOR DE SUCESSO =====
+    console.error('❌ Login falhou - nenhum indicador de sucesso encontrado');
+    console.log('📄 Trecho da resposta:', responseText);
+    
+    return await fazerLoginVouver(username, password, tentativa + 1);
+    
   } catch (error) {
-    console.error("❌ Erro ao fazer login no Vouver:", error.message);
-    return false;
+    console.error(`❌ Erro na tentativa ${tentativa} de login:`, error.message);
+    
+    if (error.response) {
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.error('📊 DETALHES DO ERRO:');
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.error('Status:', error.response.status);
+      console.error('StatusText:', error.response.statusText);
+      console.error('Headers:', JSON.stringify(error.response.headers, null, 2));
+      
+      if (error.response.data) {
+        const dataStr = error.response.data.toString().substring(0, 500);
+        console.error('Data (primeiros 500 chars):', dataStr);
+      }
+      
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      
+      if (error.response.status === 403) {
+        console.error('🚫 ERRO 403: Possíveis causas:');
+        console.error('   1. IP do Railway bloqueado pelo Vouver');
+        console.error('   2. Proteção anti-bot (Cloudflare/reCAPTCHA)');
+        console.error('   3. User-Agent suspeito');
+        console.error('   4. Rate limiting');
+        
+        const cfRay = error.response.headers['cf-ray'];
+        const server = error.response.headers['server'];
+        
+        if (cfRay || (server && server.toLowerCase().includes('cloudflare'))) {
+          console.error('   ⚠️ CLOUDFLARE DETECTADO!');
+          console.error('   → Vouver está protegido por Cloudflare');
+          console.error('   → Pode estar bloqueando IPs de datacenter');
+        }
+      }
+    }
+    
+    if (error.code === 'ECONNRESET' || 
+        error.code === 'ETIMEDOUT' || 
+        error.code === 'ENOTFOUND' ||
+        error.message.includes('timeout')) {
+      
+      console.log('⚠️ Erro de conexão, tentando novamente...');
+      return await fazerLoginVouver(username, password, tentativa + 1);
+    }
+    
+    if (error.response && error.response.status === 403) {
+      console.error('🛑 Erro 403 persistente - parando tentativas');
+      return false;
+    }
+    
+    return await fazerLoginVouver(username, password, tentativa + 1);
   }
 }
 
@@ -727,6 +910,15 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
     return mediaType === 'movie' ? 110 : 42;
   }
 }
+
+// ===== HEALTH CHECK =====
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
 
 // ===== ENDPOINTS WEB =====
 
@@ -1583,7 +1775,23 @@ async function iniciarServidor() {
       const loginSucesso = await fazerLoginVouver(LOGIN_USER, LOGIN_PASS);
       
       if (!loginSucesso) {
-        console.error('⚠️ Login automático falhou.');
+        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.error('⚠️ MODO DEGRADADO ATIVADO');
+        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.error('Login no Vouver falhou, mas sistema continua funcionando.');
+        console.error('Algumas funcionalidades podem estar limitadas:');
+        console.error('  - Cache pode estar vazio');
+        console.error('  - Busca pode não funcionar');
+        console.error('  - Streaming pode falhar');
+        console.error('');
+        console.error('💡 SOLUÇÕES:');
+        console.error('  1. Verifique credenciais: LOGIN_USER e LOGIN_PASS');
+        console.error('  2. Teste login manual em: http://vouver.me');
+        console.error('  3. Considere usar proxy se IP estiver bloqueado');
+        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        
+        userSession.user = LOGIN_USER;
+        userSession.pass = LOGIN_PASS;
       }
     }
 
