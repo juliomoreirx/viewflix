@@ -37,21 +37,37 @@ const MOVIE_BASE = process.env.MOVIE_BASE || 'http://goplay.icu/movie';
 // Cloudflare Worker
 const CLOUDFLARE_WORKER_URL = process.env.CLOUDFLARE_WORKER_URL;
 
-// ===== PROXY BRIGHTDATA (RESIDENCIAL) =====
-const BRIGHTDATA_PROXY_CONFIG = {
-  host: '104.207.48.184',
-  port: 3129,
-  auth: {
-    username: 'brd-customer-hl_6a7d13f3-zone-login_proxy',
-    password: 'c99bn07nk0fs'
-  },
-  protocol: 'http'
-};
+// ===== PROXIES RESIDENCIAIS BRASILEIRAS (AUTENTICAÇÃO POR IP) =====
+const PROXIES_RESIDENCIAIS = [
+  { host: '104.207.48.184', port: 3129, country: 'Brazil' },
+  { host: '216.26.239.182', port: 3129, country: 'Brazil' },
+  { host: '104.207.49.18', port: 3129, country: 'Brazil' },
+  { host: '209.50.177.83', port: 3129, country: 'Brazil' },
+  { host: '65.111.21.81', port: 3129, country: 'Brazil' },
+  { host: '216.26.239.101', port: 3129, country: 'Brazil' },
+  { host: '45.3.53.43', port: 3129, country: 'Brazil' }
+];
 
-console.log('🌍 Configuração Proxy BrightData:');
-console.log(`   Host: ${BRIGHTDATA_PROXY_CONFIG.host}`);
-console.log(`   Port: ${BRIGHTDATA_PROXY_CONFIG.port}`);
-console.log(`   User: ${BRIGHTDATA_PROXY_CONFIG.auth.username}`);
+let PROXY_INDEX = 0;
+
+// Função para obter próxima proxy (rotação automática)
+function getNextProxy() {
+  const proxy = PROXIES_RESIDENCIAIS[PROXY_INDEX];
+  PROXY_INDEX = (PROXY_INDEX + 1) % PROXIES_RESIDENCIAIS.length;
+  
+  console.log(`🌍 Usando proxy: ${proxy.host}:${proxy.port} (${proxy.country})`);
+  
+  return {
+    host: proxy.host,
+    port: proxy.port,
+    protocol: 'http'
+  };
+}
+
+console.log('🌍 Proxies Residenciais Configuradas:');
+PROXIES_RESIDENCIAIS.forEach((p, i) => {
+  console.log(`   ${i + 1}. ${p.host}:${p.port} (${p.country})`);
+});
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
 const requiredVars = {
@@ -319,25 +335,21 @@ function strictCORS(req, res, next) {
   next();
 }
 
-// ===== FUNÇÃO DE LOGIN (COM PROXY BRIGHTDATA) =====
+// ===== FUNÇÃO DE LOGIN (COM PROXIES RESIDENCIAIS) =====
 
 async function fazerLoginVouver(username, password, tentativa = 1) {
-  const MAX_TENTATIVAS = 3;
+  const MAX_TENTATIVAS = 7; // Uma tentativa por proxy
   
   if (tentativa > MAX_TENTATIVAS) {
-    console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas de login`);
+    console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas (testou todas as proxies)`);
     return false;
-  }
-  
-  if (tentativa > 1) {
-    const delay = tentativa * 2000;
-    console.log(`⏳ Aguardando ${delay/1000}s antes da tentativa ${tentativa}...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
   }
   
   console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
   console.log(`👤 Usuário: ${username}`);
-  console.log(`🌍 Usando BrightData Proxy: ${BRIGHTDATA_PROXY_CONFIG.host}:${BRIGHTDATA_PROXY_CONFIG.port}`);
+  
+  // Obter próxima proxy da lista (rotação automática)
+  const proxy = getNextProxy();
   
   try {
     // PASSO 1: Acessar página de login para obter cookies iniciais
@@ -345,8 +357,8 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     
     const loginPageResponse = await axios.get(`${BASE_URL}/index.php?page=login`, {
       headers: HEADERS,
-      proxy: BRIGHTDATA_PROXY_CONFIG,
-      timeout: 45000,
+      proxy: proxy,
+      timeout: 30000,
       maxRedirects: 5
     });
     
@@ -390,8 +402,8 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
           'Referer': `${BASE_URL}/index.php?page=login`,
           'Cookie': cookieString
         },
-        proxy: BRIGHTDATA_PROXY_CONFIG,
-        timeout: 45000,
+        proxy: proxy,
+        timeout: 30000,
         maxRedirects: 5
       }
     );
@@ -433,8 +445,8 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
             ...HEADERS,
             'Cookie': cookieString
           },
-          proxy: BRIGHTDATA_PROXY_CONFIG,
-          timeout: 45000,
+          proxy: proxy,
+          timeout: 30000,
           maxRedirects: 5
         }
       );
@@ -445,6 +457,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       if (homepageHtml.includes('Meu Perfil') && homepageHtml.includes('Sair')) {
         console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
         console.log(`🍪 Total de cookies: ${cookiesArray.length}`);
+        console.log(`🌍 Proxy funcionando: ${proxy.host}:${proxy.port}`);
         
         cookiesArray.forEach(c => {
           console.log(`   🍪 ${c.name} = ${c.value.substring(0, 20)}...`);
@@ -473,14 +486,16 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     console.error(`❌ Erro na tentativa ${tentativa}:`, error.message);
     
     if (error.code) {
-      console.error('   Código do erro:', error.code);
+      console.error(`   Código do erro: ${error.code}`);
     }
     
     if (error.response) {
-      console.error('   Status:', error.response.status);
+      console.error(`   Status: ${error.response.status}`);
     }
     
+    // Tentar próxima proxy
     if (tentativa < MAX_TENTATIVAS) {
+      console.log(`🔄 Tentando próxima proxy...`);
       return await fazerLoginVouver(username, password, tentativa + 1);
     }
     
@@ -488,7 +503,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
-// ===== FUNÇÃO: ATUALIZAR CACHE (COM WORKER OU PROXY BRIGHTDATA) =====
+// ===== FUNÇÃO: ATUALIZAR CACHE (COM WORKER OU PROXIES) =====
 
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
@@ -581,9 +596,9 @@ async function atualizarCache() {
       }
     }
     
-    // ===== 3. BUSCAR VIA PROXY BRIGHTDATA =====
+    // ===== 3. BUSCAR VIA PROXIES RESIDENCIAIS =====
     if (SESSION_COOKIES) {
-      console.log('🌍 Buscando cache via BrightData Proxy...');
+      console.log('🌍 Buscando cache via Proxies Residenciais...');
       
       try {
         const cacheResponse = await axios.get(
@@ -595,8 +610,8 @@ async function atualizarCache() {
               'Accept': 'application/json, text/plain, */*',
               'Referer': `${BASE_URL}/index.php?page=homepage`
             },
-            proxy: BRIGHTDATA_PROXY_CONFIG,
-            timeout: 45000
+            proxy: getNextProxy(),
+            timeout: 30000
           }
         );
         
@@ -617,7 +632,7 @@ async function atualizarCache() {
           CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
           
-          console.log(`✅ Cache obtido via BrightData: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          console.log(`✅ Cache obtido via Proxies: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
           
           // Salvar em content.json
           try {
@@ -637,7 +652,7 @@ async function atualizarCache() {
           return;
         }
       } catch (proxyError) {
-        console.error('❌ Erro ao buscar cache via BrightData:', proxyError.message);
+        console.error('❌ Erro ao buscar cache via Proxies:', proxyError.message);
       }
     }
     
@@ -702,7 +717,7 @@ function limparTexto(texto) {
   return texto;
 }
 
-// ===== BUSCAR DETALHES (WORKER PRIMEIRO, BRIGHTDATA FALLBACK) =====
+// ===== BUSCAR DETALHES (WORKER PRIMEIRO, PROXIES FALLBACK) =====
 
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
@@ -734,8 +749,8 @@ async function buscarDetalhes(id, type) {
       }
     }
     
-    // ===== BUSCAR VIA BRIGHTDATA PROXY =====
-    console.log(`🌍 Buscando detalhes via BrightData: ${type}/${id}...`);
+    // ===== BUSCAR VIA PROXIES RESIDENCIAIS =====
+    console.log(`🌍 Buscando detalhes via Proxies: ${type}/${id}...`);
     
     const response = await axios.get(
       `${BASE_URL}/index.php`,
@@ -745,8 +760,8 @@ async function buscarDetalhes(id, type) {
           ...HEADERS,
           'Cookie': SESSION_COOKIES
         },
-        proxy: BRIGHTDATA_PROXY_CONFIG,
-        timeout: 45000,
+        proxy: getNextProxy(),
+        timeout: 30000,
         responseType: 'arraybuffer'
       }
     );
@@ -784,8 +799,8 @@ async function buscarDetalhes(id, type) {
             ...HEADERS,
             'Cookie': SESSION_COOKIES
           },
-          proxy: BRIGHTDATA_PROXY_CONFIG,
-          timeout: 45000,
+          proxy: getNextProxy(),
+          timeout: 30000,
           responseType: 'arraybuffer'
         }
       );
@@ -962,7 +977,8 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    proxy: 'BrightData Residencial',
+    proxy: 'Proxies Residenciais Brasileiras',
+    proxiesCount: PROXIES_RESIDENCIAIS.length,
     cacheSize: {
       movies: CACHE_CONTEUDO.movies.length,
       series: CACHE_CONTEUDO.series.length
@@ -1460,7 +1476,8 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         movies: CACHE_CONTEUDO.movies.length,
         series: CACHE_CONTEUDO.series.length
       },
-      proxy: 'BrightData Residencial',
+      proxy: 'Proxies Residenciais Brasileiras',
+      proxiesCount: PROXIES_RESIDENCIAIS.length,
       session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     
@@ -1582,8 +1599,11 @@ async function iniciarServidor() {
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('⚠️ MODO DEGRADADO ATIVADO');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.error('Login no Vouver falhou, mas sistema continua funcionando.');
-        console.error('Algumas funcionalidades podem estar limitadas.');
+        console.error('Login no Vouver falhou após testar todas as proxies.');
+        console.error('Possíveis causas:');
+        console.error('  - Todas as proxies podem estar bloqueadas');
+        console.error('  - Problema de autenticação por IP');
+        console.error('  - Vouver.me pode estar fora do ar');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         
         userSession.user = LOGIN_USER;
@@ -1604,11 +1624,11 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - BrightData Proxy Edition!');
+      console.log('🚀 FastTV Server - Proxies Residenciais Edition!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌍 Proxy: BrightData Residencial`);
+      console.log(`🌍 Proxies: ${PROXIES_RESIDENCIAIS.length} Brasileiras Residenciais`);
       console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
