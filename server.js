@@ -16,14 +16,6 @@ const mongoose = require('mongoose');
 // ===== IMPORTA BOT DO TELEGRAM =====
 const telegramBot = require('./telegram-bot');
 
-// ===== IMPORTA LOGIN E CACHE COM PUPPETEER =====
-const { 
-  fazerLoginComPuppeteer, 
-  buscarCacheComPuppeteer, 
-  buscarCacheAlternativo,
-  buscarDetalhesComPuppeteer 
-} = require('./vouver-puppeteer');
-
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
 const DOMINIO_PUBLICO = process.env.DOMINIO_PUBLICO || 'http://localhost:3000';
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -44,6 +36,22 @@ const MOVIE_BASE = process.env.MOVIE_BASE || 'http://goplay.icu/movie';
 
 // Cloudflare Worker
 const CLOUDFLARE_WORKER_URL = process.env.CLOUDFLARE_WORKER_URL;
+
+// ===== PROXY BRIGHTDATA (RESIDENCIAL) =====
+const BRIGHTDATA_PROXY_CONFIG = {
+  host: '104.207.48.184',
+  port: 3129,
+  auth: {
+    username: 'brd-customer-hl_6a7d13f3-zone-login_proxy',
+    password: 'c99bn07nk0fs'
+  },
+  protocol: 'http'
+};
+
+console.log('🌍 Configuração Proxy BrightData:');
+console.log(`   Host: ${BRIGHTDATA_PROXY_CONFIG.host}`);
+console.log(`   Port: ${BRIGHTDATA_PROXY_CONFIG.port}`);
+console.log(`   User: ${BRIGHTDATA_PROXY_CONFIG.auth.username}`);
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
 const requiredVars = {
@@ -66,8 +74,6 @@ if (!MP_ACCESS_TOKEN) {
 
 if (CLOUDFLARE_WORKER_URL) {
   console.log(`☁️ Cloudflare Worker configurado: ${CLOUDFLARE_WORKER_URL}`);
-} else {
-  console.log('⚠️ CLOUDFLARE_WORKER_URL não configurado - usando proxies públicas');
 }
 
 // ===== LOGS DE INICIALIZAÇÃO =====
@@ -166,10 +172,11 @@ const jar = new CookieJar();
 const client = wrapper(axios.create({ jar }));
 
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-  "Origin": BASE_URL,
-  "Referer": `${BASE_URL}/index.php?page=login`,
-  "X-Requested-With": "XMLHttpRequest"
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Connection": "keep-alive"
 };
 
 app.use(express.json());
@@ -179,8 +186,7 @@ app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 // ===== ESTADO GLOBAL =====
 let userSession = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
-let PROXY_FUNCIONANDO = null;
-let COOKIES_PUPPETEER = null;
+let SESSION_COOKIES = '';
 
 // ===== FUNÇÕES DE SEGURANÇA =====
 
@@ -313,98 +319,10 @@ function strictCORS(req, res, next) {
   next();
 }
 
-// ===== FUNÇÃO: LOGIN VIA CLOUDFLARE WORKER =====
-
-async function fazerLoginViaCloudflare(username, password) {
-  try {
-    console.log('☁️ Fazendo login via Cloudflare Worker...');
-    
-    const response = await axios.post(
-      `${CLOUDFLARE_WORKER_URL}/proxy/app/_login.php`, 
-      new URLSearchParams({
-        'username': username,
-        'password': password,
-        'type': '1'
-      }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': 'http://vouver.me/index.php?page=login',
-          'X-Requested-With': 'XMLHttpRequest'
-        },
-        timeout: 15000,
-        maxRedirects: 5
-      }
-    );
-    
-    console.log('📊 Resposta do login:', response.data);
-    
-    if (response.data && response.data.toString().trim() === '1') {
-      console.log('✅ Login AJAX via Cloudflare Worker bem-sucedido!');
-      
-      const setCookieHeaders = response.headers['set-cookie'] || [];
-      const cookies = [];
-      
-      if (Array.isArray(setCookieHeaders)) {
-        setCookieHeaders.forEach(cookieStr => {
-          const parts = cookieStr.split(';')[0].split('=');
-          if (parts.length === 2) {
-            cookies.push({
-              name: parts[0].trim(),
-              value: parts[1].trim(),
-              domain: '.vouver.me',
-              path: '/',
-              secure: false,
-              httpOnly: false
-            });
-          }
-        });
-      }
-      
-      if (cookies.length === 0) {
-        console.log('⚠️ Nenhum cookie na resposta, criando cookie padrão...');
-        cookies.push({
-          name: 'PHPSESSID',
-          value: 'cloudflare-' + Date.now() + '-' + Math.random().toString(36).substring(7),
-          domain: '.vouver.me',
-          path: '/',
-          secure: false,
-          httpOnly: false
-        });
-      }
-      
-      console.log(`🍪 ${cookies.length} cookies extraídos`);
-      
-      return {
-        success: true,
-        cookies: cookies
-      };
-    } else {
-      console.log('❌ Login falhou, resposta:', response.data);
-      return {
-        success: false,
-        cookies: []
-      };
-    }
-    
-  } catch (error) {
-    console.error('❌ Erro ao fazer login via Cloudflare Worker:', error.message);
-    if (error.response) {
-      console.error('   Status:', error.response.status);
-      console.error('   Data:', error.response.data);
-    }
-    return {
-      success: false,
-      cookies: []
-    };
-  }
-}
-
-// ===== FUNÇÃO DE LOGIN (CLOUDFLARE WORKER PRIMEIRO) =====
+// ===== FUNÇÃO DE LOGIN (COM PROXY BRIGHTDATA) =====
 
 async function fazerLoginVouver(username, password, tentativa = 1) {
-  const MAX_TENTATIVAS = 2;
+  const MAX_TENTATIVAS = 3;
   
   if (tentativa > MAX_TENTATIVAS) {
     console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas de login`);
@@ -412,79 +330,155 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
   
   if (tentativa > 1) {
-    const delay = tentativa * 3000;
+    const delay = tentativa * 2000;
     console.log(`⏳ Aguardando ${delay/1000}s antes da tentativa ${tentativa}...`);
     await new Promise(resolve => setTimeout(resolve, delay));
   }
   
   console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
   console.log(`👤 Usuário: ${username}`);
+  console.log(`🌍 Usando BrightData Proxy: ${BRIGHTDATA_PROXY_CONFIG.host}:${BRIGHTDATA_PROXY_CONFIG.port}`);
   
   try {
-    // ===== ESTRATÉGIA 1: CLOUDFLARE WORKER (PRIORIDADE) =====
-    if (CLOUDFLARE_WORKER_URL) {
-      console.log('☁️ Usando Cloudflare Worker como proxy...');
-      
-      const result = await fazerLoginViaCloudflare(username, password);
-      
-      if (result.success) {
-        userSession.user = username;
-        userSession.pass = password;
-        
-        result.cookies.forEach(cookie => {
-          const cookieString = `${cookie.name}=${cookie.value}; Domain=${cookie.domain || '.vouver.me'}; Path=${cookie.path || '/'}`;
-          jar.setCookieSync(cookieString, BASE_URL);
+    // PASSO 1: Acessar página de login para obter cookies iniciais
+    console.log('📡 Acessando página de login...');
+    
+    const loginPageResponse = await axios.get(`${BASE_URL}/index.php?page=login`, {
+      headers: HEADERS,
+      proxy: BRIGHTDATA_PROXY_CONFIG,
+      timeout: 45000,
+      maxRedirects: 5
+    });
+    
+    // Extrair cookies da primeira requisição
+    const setCookies = loginPageResponse.headers['set-cookie'] || [];
+    let cookiesArray = [];
+    
+    setCookies.forEach(cookieStr => {
+      const parts = cookieStr.split(';')[0].split('=');
+      if (parts.length === 2) {
+        cookiesArray.push({
+          name: parts[0].trim(),
+          value: parts[1].trim()
         });
-        
-        COOKIES_PUPPETEER = result.cookies;
-        
-        console.log('✅ Login via Cloudflare Worker realizado com sucesso!');
-        console.log(`💾 ${result.cookies.length} cookies salvos`);
-        
-        await atualizarCache();
-        return true;
-      } else {
-        console.log('⚠️ Cloudflare Worker falhou, tentando Puppeteer...');
       }
-    }
+    });
     
-    // ===== ESTRATÉGIA 2: PUPPETEER COM PROXY (FALLBACK) =====
-    console.log('🤖 Usando Puppeteer (navegador real)');
+    // Criar string de cookies
+    let cookieString = cookiesArray.map(c => `${c.name}=${c.value}`).join('; ');
     
-    const result = await fazerLoginComPuppeteer(username, password, BASE_URL);
+    console.log(`🍪 Cookies iniciais obtidos: ${cookiesArray.length}`);
     
-    if (result.success && result.cookies.length > 0) {
-      result.cookies.forEach(cookie => {
-        const cookieString = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${cookie.path}`;
-        jar.setCookieSync(cookieString, BASE_URL);
+    // PASSO 2: Fazer login via AJAX
+    console.log('🚀 Fazendo login via AJAX...');
+    
+    const loginData = new URLSearchParams({
+      'username': username,
+      'password': password,
+      'type': '1'
+    });
+    
+    const loginResponse = await axios.post(
+      `${BASE_URL}/app/_login.php`,
+      loginData.toString(),
+      {
+        headers: {
+          ...HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Origin': BASE_URL,
+          'Referer': `${BASE_URL}/index.php?page=login`,
+          'Cookie': cookieString
+        },
+        proxy: BRIGHTDATA_PROXY_CONFIG,
+        timeout: 45000,
+        maxRedirects: 5
+      }
+    );
+    
+    const loginResult = loginResponse.data;
+    console.log('📊 Resposta do login:', loginResult);
+    
+    if (loginResult && loginResult.toString().trim() === '1') {
+      console.log('✅ Login AJAX bem-sucedido!');
+      
+      // Extrair novos cookies da resposta de login
+      const loginCookies = loginResponse.headers['set-cookie'] || [];
+      
+      loginCookies.forEach(cookieStr => {
+        const parts = cookieStr.split(';')[0].split('=');
+        if (parts.length === 2) {
+          const name = parts[0].trim();
+          const value = parts[1].trim();
+          
+          // Atualizar ou adicionar cookie
+          const existingIndex = cookiesArray.findIndex(c => c.name === name);
+          if (existingIndex >= 0) {
+            cookiesArray[existingIndex].value = value;
+          } else {
+            cookiesArray.push({ name, value });
+          }
+        }
       });
       
-      userSession.user = username;
-      userSession.pass = password;
+      // PASSO 3: Verificar login acessando homepage
+      console.log('📡 Verificando login na homepage...');
       
-      if (result.proxy) {
-        const [host, port] = result.proxy.split(':');
-        PROXY_FUNCIONANDO = {
-          host: host,
-          port: parseInt(port)
-        };
-        console.log(`💾 Proxy salva para uso futuro: ${result.proxy}`);
+      cookieString = cookiesArray.map(c => `${c.name}=${c.value}`).join('; ');
+      
+      const homepageResponse = await axios.get(
+        `${BASE_URL}/index.php?page=homepage`,
+        {
+          headers: {
+            ...HEADERS,
+            'Cookie': cookieString
+          },
+          proxy: BRIGHTDATA_PROXY_CONFIG,
+          timeout: 45000,
+          maxRedirects: 5
+        }
+      );
+      
+      const homepageHtml = homepageResponse.data;
+      
+      // Verificar se está logado
+      if (homepageHtml.includes('Meu Perfil') && homepageHtml.includes('Sair')) {
+        console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
+        console.log(`🍪 Total de cookies: ${cookiesArray.length}`);
+        
+        cookiesArray.forEach(c => {
+          console.log(`   🍪 ${c.name} = ${c.value.substring(0, 20)}...`);
+        });
+        
+        // Salvar sessão
+        userSession.user = username;
+        userSession.pass = password;
+        SESSION_COOKIES = cookieString;
+        
+        // Atualizar cache
+        await atualizarCache();
+        
+        return true;
+      } else {
+        console.log('⚠️ Homepage não indica login bem-sucedido');
+        return await fazerLoginVouver(username, password, tentativa + 1);
       }
       
-      COOKIES_PUPPETEER = result.cookies;
-      console.log(`💾 ${result.cookies.length} cookies do Puppeteer salvos`);
-      
-      console.log('✅ Login no Vouver realizado com sucesso!');
-      
-      await atualizarCache();
-      return true;
     } else {
-      console.error('❌ Login falhou');
+      console.error('❌ Login falhou, resposta:', loginResult);
       return await fazerLoginVouver(username, password, tentativa + 1);
     }
     
   } catch (error) {
     console.error(`❌ Erro na tentativa ${tentativa}:`, error.message);
+    
+    if (error.code) {
+      console.error('   Código do erro:', error.code);
+    }
+    
+    if (error.response) {
+      console.error('   Status:', error.response.status);
+    }
     
     if (tentativa < MAX_TENTATIVAS) {
       return await fazerLoginVouver(username, password, tentativa + 1);
@@ -494,13 +488,13 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
-// ===== FUNÇÃO: ATUALIZAR CACHE (CLOUDFLARE WORKER PRIMEIRO) =====
+// ===== FUNÇÃO: ATUALIZAR CACHE (COM WORKER OU PROXY BRIGHTDATA) =====
 
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
   
   try {
-    // ===== 1. TENTAR ARQUIVO LOCAL PRIMEIRO (RÁPIDO) =====
+    // ===== 1. TENTAR ARQUIVO LOCAL PRIMEIRO =====
     const contentPath = path.join(__dirname, 'content.json');
     
     if (fs.existsSync(contentPath)) {
@@ -527,83 +521,87 @@ async function atualizarCache() {
           
           console.log(`✅ Cache carregado do arquivo JSON: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
           return;
-        } else {
-          console.log('⚠️ Arquivo content.json está vazio');
         }
       } catch (jsonError) {
         console.error('❌ Erro ao ler content.json:', jsonError.message);
       }
-    } else {
-      console.log('⚠️ Arquivo content.json não encontrado');
     }
     
     // ===== 2. TENTAR VIA CLOUDFLARE WORKER =====
-    if (CLOUDFLARE_WORKER_URL) {
+    if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
       
       try {
-        const response = await axios.get(`${CLOUDFLARE_WORKER_URL}/proxy/app/_search.php?q=a`, {
-          timeout: 30000,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        const response = await axios.post(
+          `${CLOUDFLARE_WORKER_URL}/cache-direct`,
+          { cookies: SESSION_COOKIES },
+          { timeout: 30000 }
+        );
+        
+        const data = response.data;
+        
+        if (data.success && data.data) {
+          let rawMovies = [], rawSeries = [];
+          
+          if (data.data.data) {
+            rawMovies = data.data.data.movies || [];
+            rawSeries = data.data.data.series || [];
+          } else if (data.data.movies) {
+            rawMovies = data.data.movies;
+            rawSeries = data.data.series;
           }
-        });
-        
-        const cacheData = response.data;
-        let rawMovies = [], rawSeries = [];
-        
-        if (cacheData.data) {
-          rawMovies = cacheData.data.movies || [];
-          rawSeries = cacheData.data.series || [];
-        } else if (cacheData.movies) {
-          rawMovies = cacheData.movies;
-          rawSeries = cacheData.series;
-        }
-        
-        if (rawMovies.length > 0 || rawSeries.length > 0) {
-          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
-          CACHE_CONTEUDO.lastUpdated = Date.now();
           
-          console.log(`✅ Cache obtido via Cloudflare Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
-          
-          // Salvar em content.json para próximos deploys
-          try {
-            const dataToSave = {
-              status: true,
-              error: null,
-              data: {
-                movies: rawMovies,
-                series: rawSeries
-              },
-              lastUpdated: new Date().toISOString()
-            };
+          if (rawMovies.length > 0 || rawSeries.length > 0) {
+            CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+            CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+            CACHE_CONTEUDO.lastUpdated = Date.now();
             
-            fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
-            console.log('💾 Cache salvo em content.json para próximos deploys');
-          } catch (saveError) {
-            console.log('⚠️ Não foi possível salvar content.json:', saveError.message);
+            console.log(`✅ Cache obtido via Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+            
+            // Salvar em content.json
+            try {
+              const dataToSave = {
+                status: true,
+                error: null,
+                data: { movies: rawMovies, series: rawSeries },
+                lastUpdated: new Date().toISOString()
+              };
+              
+              fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
+              console.log('💾 Cache salvo em content.json');
+            } catch (saveError) {
+              console.log('⚠️ Não foi possível salvar content.json');
+            }
+            
+            return;
           }
-          
-          return;
         }
       } catch (workerError) {
-        console.log('⚠️ Cloudflare Worker falhou:', workerError.message);
+        console.log('⚠️ Worker falhou:', workerError.message);
       }
     }
     
-    // ===== 3. TENTAR VIA PUPPETEER (FALLBACK) =====
-    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
-      console.log('🤖 Tentando buscar cache via Puppeteer...');
+    // ===== 3. BUSCAR VIA PROXY BRIGHTDATA =====
+    if (SESSION_COOKIES) {
+      console.log('🌍 Buscando cache via BrightData Proxy...');
       
-      let cacheData = await buscarCacheComPuppeteer(COOKIES_PUPPETEER, BASE_URL);
-      
-      if (!cacheData && buscarCacheAlternativo) {
-        console.log('⚠️ Método padrão falhou, tentando método alternativo...');
-        cacheData = await buscarCacheAlternativo(COOKIES_PUPPETEER, BASE_URL);
-      }
-      
-      if (cacheData) {
+      try {
+        const cacheResponse = await axios.get(
+          `${BASE_URL}/app/_search.php?q=a`,
+          {
+            headers: {
+              ...HEADERS,
+              'Cookie': SESSION_COOKIES,
+              'Accept': 'application/json, text/plain, */*',
+              'Referer': `${BASE_URL}/index.php?page=homepage`
+            },
+            proxy: BRIGHTDATA_PROXY_CONFIG,
+            timeout: 45000
+          }
+        );
+        
+        const cacheData = cacheResponse.data;
+        
         let rawMovies = [], rawSeries = [];
         
         if (cacheData.data) {
@@ -619,17 +617,14 @@ async function atualizarCache() {
           CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
           
-          console.log(`✅ Cache obtido via Puppeteer: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          console.log(`✅ Cache obtido via BrightData: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
           
           // Salvar em content.json
           try {
             const dataToSave = {
               status: true,
               error: null,
-              data: {
-                movies: rawMovies,
-                series: rawSeries
-              },
+              data: { movies: rawMovies, series: rawSeries },
               lastUpdated: new Date().toISOString()
             };
             
@@ -641,10 +636,12 @@ async function atualizarCache() {
           
           return;
         }
+      } catch (proxyError) {
+        console.error('❌ Erro ao buscar cache via BrightData:', proxyError.message);
       }
     }
     
-    console.error("⚠️ Cache não pôde ser carregado - sistema funcionará em modo limitado");
+    console.error("⚠️ Cache não pôde ser carregado");
     
   } catch (error) {
     console.error("❌ Erro ao atualizar cache:", error.message);
@@ -705,43 +702,54 @@ function limparTexto(texto) {
   return texto;
 }
 
-// ===== BUSCAR DETALHES (PUPPETEER PRIMEIRO, AXIOS FALLBACK) =====
+// ===== BUSCAR DETALHES (WORKER PRIMEIRO, BRIGHTDATA FALLBACK) =====
 
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
   
   try {
-    // ===== TENTAR VIA PUPPETEER PRIMEIRO (SE TEM COOKIES) =====
-    if (COOKIES_PUPPETEER && COOKIES_PUPPETEER.length > 0) {
-      console.log('🤖 Buscando detalhes via Puppeteer (sessão autenticada)...');
+    // ===== TENTAR VIA CLOUDFLARE WORKER =====
+    if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
+      console.log(`🔍 Buscando detalhes via Worker: ${type}/${id}...`);
       
-      const detalhes = await buscarDetalhesComPuppeteer(id, type, COOKIES_PUPPETEER, BASE_URL);
-      
-      if (detalhes) {
-        return detalhes;
-      } else {
-        console.log('⚠️ Puppeteer falhou, tentando Axios...');
+      try {
+        const response = await axios.post(
+          `${CLOUDFLARE_WORKER_URL}/details-direct`,
+          {
+            id: id,
+            type: type,
+            cookies: SESSION_COOKIES
+          },
+          { timeout: 15000 }
+        );
+
+        const data = response.data;
+
+        if (data.success && data.data) {
+          console.log('✅ Detalhes obtidos via Worker');
+          return data.data;
+        }
+      } catch (workerError) {
+        console.log('⚠️ Worker falhou:', workerError.message);
       }
     }
     
-    // ===== FALLBACK: VIA AXIOS (COM PROXY SE DISPONÍVEL) =====
-    const axiosConfig = {
-      params: { page: pageType, id },
-      headers: HEADERS,
-      timeout: 15000,
-      responseType: 'arraybuffer'
-    };
+    // ===== BUSCAR VIA BRIGHTDATA PROXY =====
+    console.log(`🌍 Buscando detalhes via BrightData: ${type}/${id}...`);
     
-    if (PROXY_FUNCIONANDO) {
-      axiosConfig.proxy = {
-        host: PROXY_FUNCIONANDO.host,
-        port: PROXY_FUNCIONANDO.port,
-        protocol: 'http'
-      };
-      console.log(`🌐 Usando proxy: ${PROXY_FUNCIONANDO.host}:${PROXY_FUNCIONANDO.port}`);
-    }
-    
-    let response = await client.get(`${BASE_URL}/index.php`, axiosConfig);
+    const response = await axios.get(
+      `${BASE_URL}/index.php`,
+      {
+        params: { page: pageType, id },
+        headers: {
+          ...HEADERS,
+          'Cookie': SESSION_COOKIES
+        },
+        proxy: BRIGHTDATA_PROXY_CONFIG,
+        timeout: 45000,
+        responseType: 'arraybuffer'
+      }
+    );
     
     let html = null;
     const encodings = ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1'];
@@ -751,7 +759,7 @@ async function buscarDetalhes(id, type) {
         const decoded = iconv.decode(Buffer.from(response.data), encoding);
         if (!decoded.includes('�') && !decoded.includes('?�')) {
           html = decoded;
-          console.log(`✅ Encoding correto detectado: ${encoding}`);
+          console.log(`✅ Encoding correto: ${encoding}`);
           break;
         }
       } catch (e) {
@@ -766,28 +774,26 @@ async function buscarDetalhes(id, type) {
     
     let $ = cheerio.load(html, { decodeEntities: false });
 
+    // Se não encontrou episódios e é série, tentar como filme
     if ($('.tab_episode').length === 0 && type !== 'movies') {
-      const axiosConfig2 = {
-        params: { page: 'moviedetail', id },
-        headers: HEADERS,
-        timeout: 15000,
-        responseType: 'arraybuffer'
-      };
-      
-      if (PROXY_FUNCIONANDO) {
-        axiosConfig2.proxy = {
-          host: PROXY_FUNCIONANDO.host,
-          port: PROXY_FUNCIONANDO.port,
-          protocol: 'http'
-        };
-      }
-      
-      response = await client.get(`${BASE_URL}/index.php`, axiosConfig2);
+      const response2 = await axios.get(
+        `${BASE_URL}/index.php`,
+        {
+          params: { page: 'moviedetail', id },
+          headers: {
+            ...HEADERS,
+            'Cookie': SESSION_COOKIES
+          },
+          proxy: BRIGHTDATA_PROXY_CONFIG,
+          timeout: 45000,
+          responseType: 'arraybuffer'
+        }
+      );
       
       html = null;
       for (const encoding of encodings) {
         try {
-          const decoded = iconv.decode(Buffer.from(response.data), encoding);
+          const decoded = iconv.decode(Buffer.from(response2.data), encoding);
           if (!decoded.includes('�') && !decoded.includes('?�')) {
             html = decoded;
             break;
@@ -798,7 +804,7 @@ async function buscarDetalhes(id, type) {
       }
       
       if (!html) {
-        html = iconv.decode(Buffer.from(response.data), 'ISO-8859-1');
+        html = iconv.decode(Buffer.from(response2.data), 'ISO-8859-1');
         html = corrigirCaracteresEspeciais(html);
       }
       
@@ -814,9 +820,7 @@ async function buscarDetalhes(id, type) {
       const tags = [];
       $('.left-wrap .tag').each((i, el) => {
         const tagText = limparTexto($(el).text());
-        if (tagText) {
-          tags.push(tagText);
-        }
+        if (tagText) tags.push(tagText);
       });
       
       const imdbText = limparTexto($('.left-wrap .rnd').first().text());
@@ -839,7 +843,7 @@ async function buscarDetalhes(id, type) {
           data.info.duracaoMinutos = (horas * 60) + minutos + Math.ceil(segundos / 60);
           data.info.duracaoTexto = tag;
           
-          console.log(`✅ [FILME] Duração exata extraída: ${tag} = ${data.info.duracaoMinutos} minutos`);
+          console.log(`✅ [FILME] Duração: ${tag} = ${data.info.duracaoMinutos}min`);
         }
         
         if (!tag.includes(':') && isNaN(tag) && !/^\d{4}$/.test(tag)) {
@@ -884,14 +888,11 @@ async function buscarDetalhes(id, type) {
 async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
   try {
     if (mediaType === 'movie' && duracaoDoHTML && duracaoDoHTML > 0) {
-      console.log(`✅ [FILME] Usando duração exata do HTML: ${duracaoDoHTML}min`);
+      console.log(`✅ [FILME] Usando duração exata: ${duracaoDoHTML}min`);
       
       await AssetSize.findOneAndUpdate(
         { assetId: id, mediaType: 'movie' },
-        { 
-          bytes: duracaoDoHTML * 60 * 1024 * 1024 * 15, 
-          updatedAt: new Date() 
-        },
+        { bytes: duracaoDoHTML * 60 * 1024 * 1024 * 15, updatedAt: new Date() },
         { upsert: true, new: true }
       );
       
@@ -906,11 +907,11 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
     if (cached && cached.bytes > 0) {
       const minutos = Math.round(cached.bytes / (1024 * 1024 * 15));
       const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
-      console.log(`✅ [${mediaType.toUpperCase()}] Duração do cache: ${duracaoFinal}min`);
+      console.log(`✅ Duração do cache: ${duracaoFinal}min`);
       return duracaoFinal;
     }
     
-    console.log(`🔍 [${mediaType.toUpperCase()}] Buscando tamanho via HEAD/Range: ${id}...`);
+    console.log(`🔍 Buscando tamanho via HEAD: ${id}...`);
     
     const base = mediaType === 'movie' ? MOVIE_BASE : VIDEO_BASE;
     const url = `${base}/${userSession.user}/${userSession.pass}/${id}.mp4`;
@@ -938,15 +939,15 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
           { upsert: true, new: true }
         );
         
-        console.log(`✅ [${mediaType.toUpperCase()}] Duração via HEAD: ${duracaoFinal}min`);
+        console.log(`✅ Duração via HEAD: ${duracaoFinal}min`);
         return duracaoFinal;
       }
     } catch (headError) {
-      console.log(`⚠️ [${mediaType.toUpperCase()}] HEAD falhou: ${headError.message}`);
+      console.log(`⚠️ HEAD falhou: ${headError.message}`);
     }
     
     const duracaoPadrao = mediaType === 'movie' ? 110 : 42;
-    console.log(`⚠️ [${mediaType.toUpperCase()}] Usando duração padrão: ${duracaoPadrao}min`);
+    console.log(`⚠️ Usando duração padrão: ${duracaoPadrao}min`);
     return duracaoPadrao;
     
   } catch (error) {
@@ -960,7 +961,13 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    proxy: 'BrightData Residencial',
+    cacheSize: {
+      movies: CACHE_CONTEUDO.movies.length,
+      series: CACHE_CONTEUDO.series.length
+    },
+    session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
   });
 });
 
@@ -1452,7 +1459,9 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       catalog: {
         movies: CACHE_CONTEUDO.movies.length,
         series: CACHE_CONTEUDO.series.length
-      }
+      },
+      proxy: 'BrightData Residencial',
+      session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     
     res.json(stats);
@@ -1574,15 +1583,7 @@ async function iniciarServidor() {
         console.error('⚠️ MODO DEGRADADO ATIVADO');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('Login no Vouver falhou, mas sistema continua funcionando.');
-        console.error('Algumas funcionalidades podem estar limitadas:');
-        console.error('  - Cache pode estar vazio');
-        console.error('  - Busca pode não funcionar');
-        console.error('  - Streaming pode falhar');
-        console.error('');
-        console.error('💡 SOLUÇÕES:');
-        console.error('  1. Verifique credenciais: LOGIN_USER e LOGIN_PASS');
-        console.error('  2. Teste login manual em: http://vouver.me');
-        console.error('  3. Configure CLOUDFLARE_WORKER_URL');
+        console.error('Algumas funcionalidades podem estar limitadas.');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         
         userSession.user = LOGIN_USER;
@@ -1603,11 +1604,12 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - Versão Final com Cloudflare Worker!');
+      console.log('🚀 FastTV Server - BrightData Proxy Edition!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`☁️ Cloudflare Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo ✅' : 'Inativo ⚠️'}`);
+      console.log(`🌍 Proxy: BrightData Residencial`);
+      console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
       console.log(`📝 Encoding: UTF-8 corrigido (200+ padrões)`);
