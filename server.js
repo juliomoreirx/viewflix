@@ -3,6 +3,8 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
+const { HttpProxyAgent } = require('http-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const cheerio = require('cheerio');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -37,37 +39,33 @@ const MOVIE_BASE = process.env.MOVIE_BASE || 'http://goplay.icu/movie';
 // Cloudflare Worker
 const CLOUDFLARE_WORKER_URL = process.env.CLOUDFLARE_WORKER_URL;
 
-// ===== PROXIES RESIDENCIAIS BRASILEIRAS (AUTENTICAÇÃO POR IP) =====
-const PROXIES_RESIDENCIAIS = [
-  { host: '104.207.48.184', port: 3129, country: 'Brazil' },
-  { host: '216.26.239.182', port: 3129, country: 'Brazil' },
-  { host: '104.207.49.18', port: 3129, country: 'Brazil' },
-  { host: '209.50.177.83', port: 3129, country: 'Brazil' },
-  { host: '65.111.21.81', port: 3129, country: 'Brazil' },
-  { host: '216.26.239.101', port: 3129, country: 'Brazil' },
-  { host: '45.3.53.43', port: 3129, country: 'Brazil' }
-];
+// Cloudflare clearance cookie (obter do browser logado)
+const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 
-let PROXY_INDEX = 0;
+// ===== PROXY RESIDENCIAL (VARIÁVEIS DE AMBIENTE) =====
+const PROXY_HOST = process.env.PROXY_HOST;
+const PROXY_PORT = parseInt(process.env.PROXY_PORT);
+const PROXY_USER = process.env.PROXY_USER;
+const PROXY_PASS = process.env.PROXY_PASS;
 
-// Função para obter próxima proxy (rotação automática)
+// Função que retorna o agent da proxy configurada
 function getNextProxy() {
-  const proxy = PROXIES_RESIDENCIAIS[PROXY_INDEX];
-  PROXY_INDEX = (PROXY_INDEX + 1) % PROXIES_RESIDENCIAIS.length;
-  
-  console.log(`🌍 Usando proxy: ${proxy.host}:${proxy.port} (${proxy.country})`);
-  
+  console.log(`🌍 Usando proxy: ${PROXY_HOST}:${PROXY_PORT}`);
+  const proxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
+  return proxyUrl;
+}
+
+// Retorna o objeto de config axios com o agent correto para HTTP e HTTPS
+function getProxyConfig() {
+  const proxyUrl = getNextProxy();
   return {
-    host: proxy.host,
-    port: proxy.port,
-    protocol: 'http'
+    httpAgent: new HttpProxyAgent(proxyUrl),   // para destinos http://
+    httpsAgent: new HttpsProxyAgent(proxyUrl), // para destinos https://
+    proxy: false // desativa o handler nativo do axios
   };
 }
 
-console.log('🌍 Proxies Residenciais Configuradas:');
-PROXIES_RESIDENCIAIS.forEach((p, i) => {
-  console.log(`   ${i + 1}. ${p.host}:${p.port} (${p.country})`);
-});
+console.log(`🌍 Proxy Residencial Configurada: ${PROXY_HOST}:${PROXY_PORT}`);
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
 const requiredVars = {
@@ -188,11 +186,17 @@ const jar = new CookieJar();
 const client = wrapper(axios.create({ jar }));
 
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Connection": "keep-alive"
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+  "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Encoding": "gzip, deflate",
+  "Connection": "keep-alive",
+  "Upgrade-Insecure-Requests": "1",
+  "Cache-Control": "max-age=0",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1"
 };
 
 app.use(express.json());
@@ -335,64 +339,127 @@ function strictCORS(req, res, next) {
   next();
 }
 
-// ===== FUNÇÃO DE LOGIN (COM PROXIES RESIDENCIAIS) =====
+// ===== FUNÇÃO AUXILIAR: EXTRAIR E MESCLAR COOKIES =====
+
+function extrairCookies(setCookieHeader, cookiesArray = []) {
+  const cookies = [...cookiesArray];
+  (setCookieHeader || []).forEach(cookieStr => {
+    const pair = cookieStr.split(';')[0];
+    const idx = pair.indexOf('=');
+    if (idx > 0) {
+      const name = pair.substring(0, idx).trim();
+      const value = pair.substring(idx + 1).trim();
+      const existing = cookies.findIndex(c => c.name === name);
+      if (existing >= 0) cookies[existing].value = value;
+      else cookies.push({ name, value });
+    }
+  });
+  return cookies;
+}
+
+function cookieString(arr) {
+  return arr.map(c => `${c.name}=${c.value}`).join('; ');
+}
+
+// ===== FUNÇÃO DE LOGIN =====
 
 async function fazerLoginVouver(username, password, tentativa = 1) {
-  const MAX_TENTATIVAS = 7; // Uma tentativa por proxy
-  
+  const MAX_TENTATIVAS = 3;
+
   if (tentativa > MAX_TENTATIVAS) {
-    console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas (testou todas as proxies)`);
+    console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas`);
     return false;
   }
-  
+
   console.log(`🔐 Tentativa ${tentativa}/${MAX_TENTATIVAS} - Fazendo login no Vouver...`);
   console.log(`👤 Usuário: ${username}`);
-  
-  // Obter próxima proxy da lista (rotação automática)
-  const proxy = getNextProxy();
-  
+
   try {
-    // PASSO 1: Acessar página de login para obter cookies iniciais
-    console.log('📡 Acessando página de login...');
-    
+    // ── PASSO 1: Carregar página de login e extrair CSRF token + cookies ──
+    // Feito SEM proxy pois o Cloudflare bloqueia proxies no GET inicial
+    console.log('📡 Acessando página de login (sem proxy para evitar CF block)...');
+
     const loginPageResponse = await axios.get(`${BASE_URL}/index.php?page=login`, {
-      headers: HEADERS,
-      proxy: proxy,
+      headers: {
+        ...HEADERS,
+        'Sec-Fetch-Site': 'none'
+      },
       timeout: 30000,
       maxRedirects: 5
     });
     
-    // Extrair cookies da primeira requisição
-    const setCookies = loginPageResponse.headers['set-cookie'] || [];
-    let cookiesArray = [];
-    
-    setCookies.forEach(cookieStr => {
-      const parts = cookieStr.split(';')[0].split('=');
-      if (parts.length === 2) {
-        cookiesArray.push({
-          name: parts[0].trim(),
-          value: parts[1].trim()
-        });
-      }
+    // Log para debug
+    console.log(`📄 Status página login: ${loginPageResponse.status}`);
+    console.log(`📄 Tamanho HTML: ${loginPageResponse.data.length} chars`);
+
+    let cookiesArr = extrairCookies(loginPageResponse.headers['set-cookie']);
+
+    // Injetar cf_clearance do .env se disponível (necessário para passar Cloudflare WAF)
+    if (CF_CLEARANCE) {
+      const cfIdx = cookiesArr.findIndex(c => c.name === 'cf_clearance');
+      if (cfIdx >= 0) cookiesArr[cfIdx].value = CF_CLEARANCE;
+      else cookiesArr.push({ name: 'cf_clearance', value: CF_CLEARANCE });
+      console.log('🛡️ cf_clearance injetado do .env');
+    } else {
+      console.log('⚠️ CF_CLEARANCE não definido no .env — pode falhar no WAF');
+    }
+
+    // Extrair CSRF token do HTML
+    const htmlPage = loginPageResponse.data;
+    const csrfMatch = htmlPage.match(/name=["']csrf_token["']\s+value=["']([\w]+)["']/) || htmlPage.match(/csrf_token["']\s+value=["']([a-f0-9]+)["']/) || htmlPage.match(/name=["']csrf_token["'][^>]*value=["']([a-f0-9]+)["']/);
+    const csrfToken = csrfMatch ? csrfMatch[1] : '';
+    console.log(`🔑 CSRF token: ${csrfToken ? csrfToken.substring(0, 16) + '...' : 'NÃO ENCONTRADO'}`);
+    console.log(`🍪 Cookies iniciais: ${cookiesArr.length}`);
+
+    // ── PASSO 2: POST no form HTML (igual ao browser) ──
+    console.log('🚀 Submetendo formulário de login...');
+
+    const formData = new URLSearchParams({
+      'username': username,
+      'sifre': password,
+      'beni_hatirla': 'on',
+      'csrf_token': csrfToken,
+      'recaptcha_response': '',
+      'login': 'Acessar'
     });
-    
-    // Criar string de cookies
-    let cookieString = cookiesArray.map(c => `${c.name}=${c.value}`).join('; ');
-    
-    console.log(`🍪 Cookies iniciais obtidos: ${cookiesArray.length}`);
-    
-    // PASSO 2: Fazer login via AJAX
-    console.log('🚀 Fazendo login via AJAX...');
-    
-    const loginData = new URLSearchParams({
+
+    const formResponse = await axios.post(
+      `${BASE_URL}/index.php?page=login`,
+      formData.toString(),
+      {
+        headers: {
+          ...HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': BASE_URL,
+          'Referer': `${BASE_URL}/index.php?page=login`,
+          'Cookie': cookieString(cookiesArr),
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-User': '?1',
+          'Sec-Fetch-Dest': 'document',
+          'Upgrade-Insecure-Requests': '1'
+        },
+        timeout: 30000,
+        maxRedirects: 5,
+        validateStatus: s => s < 500
+      }
+    );
+
+    cookiesArr = extrairCookies(formResponse.headers['set-cookie'], cookiesArr);
+
+    // ── PASSO 3: AJAX login (endpoint real capturado) ──
+    console.log('🚀 Fazendo AJAX login...');
+
+    const ajaxData = new URLSearchParams({
       'username': username,
       'password': password,
+      'csrf_token': csrfToken,
       'type': '1'
     });
-    
-    const loginResponse = await axios.post(
-      `${BASE_URL}/app/_login.php`,
-      loginData.toString(),
+
+    const ajaxResponse = await axios.post(
+      `${BASE_URL}/ajax/login.php`,
+      ajaxData.toString(),
       {
         headers: {
           ...HEADERS,
@@ -400,105 +467,79 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
           'X-Requested-With': 'XMLHttpRequest',
           'Origin': BASE_URL,
           'Referer': `${BASE_URL}/index.php?page=login`,
-          'Cookie': cookieString
+          'Cookie': cookieString(cookiesArr),
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty'
         },
-        proxy: proxy,
+        timeout: 30000,
+        maxRedirects: 5,
+        validateStatus: s => s < 500
+      }
+    );
+
+    cookiesArr = extrairCookies(ajaxResponse.headers['set-cookie'], cookiesArr);
+
+    const ajaxResult = ajaxResponse.data;
+    console.log('📊 Resposta AJAX:', ajaxResult);
+
+    // ── PASSO 4: Verificar homepage ──
+    console.log('📡 Verificando login na homepage...');
+
+    const homepageResponse = await axios.get(
+      `${BASE_URL}/index.php?page=homepage`,
+      {
+        headers: {
+          ...HEADERS,
+          'Referer': `${BASE_URL}/index.php?page=login`,
+          'Cookie': cookieString(cookiesArr),
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'navigate',
+          'Upgrade-Insecure-Requests': '1'
+        },
         timeout: 30000,
         maxRedirects: 5
       }
     );
-    
-    const loginResult = loginResponse.data;
-    console.log('📊 Resposta do login:', loginResult);
-    
-    if (loginResult && loginResult.toString().trim() === '1') {
-      console.log('✅ Login AJAX bem-sucedido!');
-      
-      // Extrair novos cookies da resposta de login
-      const loginCookies = loginResponse.headers['set-cookie'] || [];
-      
-      loginCookies.forEach(cookieStr => {
-        const parts = cookieStr.split(';')[0].split('=');
-        if (parts.length === 2) {
-          const name = parts[0].trim();
-          const value = parts[1].trim();
-          
-          // Atualizar ou adicionar cookie
-          const existingIndex = cookiesArray.findIndex(c => c.name === name);
-          if (existingIndex >= 0) {
-            cookiesArray[existingIndex].value = value;
-          } else {
-            cookiesArray.push({ name, value });
-          }
-        }
+
+    cookiesArr = extrairCookies(homepageResponse.headers['set-cookie'], cookiesArr);
+    const homepageHtml = homepageResponse.data;
+
+    if (homepageHtml.includes('Meu Perfil') || homepageHtml.includes('Sair') || homepageHtml.includes('sair')) {
+      const finalCookies = cookieString(cookiesArr);
+      console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
+      console.log(`🍪 Total de cookies: ${cookiesArr.length}`);
+      cookiesArr.forEach(c => {
+        console.log(`   🍪 ${c.name} = ${c.value.substring(0, 20)}...`);
       });
-      
-      // PASSO 3: Verificar login acessando homepage
-      console.log('📡 Verificando login na homepage...');
-      
-      cookieString = cookiesArray.map(c => `${c.name}=${c.value}`).join('; ');
-      
-      const homepageResponse = await axios.get(
-        `${BASE_URL}/index.php?page=homepage`,
-        {
-          headers: {
-            ...HEADERS,
-            'Cookie': cookieString
-          },
-          proxy: proxy,
-          timeout: 30000,
-          maxRedirects: 5
-        }
-      );
-      
-      const homepageHtml = homepageResponse.data;
-      
-      // Verificar se está logado
-      if (homepageHtml.includes('Meu Perfil') && homepageHtml.includes('Sair')) {
-        console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
-        console.log(`🍪 Total de cookies: ${cookiesArray.length}`);
-        console.log(`🌍 Proxy funcionando: ${proxy.host}:${proxy.port}`);
-        
-        cookiesArray.forEach(c => {
-          console.log(`   🍪 ${c.name} = ${c.value.substring(0, 20)}...`);
-        });
-        
-        // Salvar sessão
-        userSession.user = username;
-        userSession.pass = password;
-        SESSION_COOKIES = cookieString;
-        
-        // Atualizar cache
-        await atualizarCache();
-        
-        return true;
-      } else {
-        console.log('⚠️ Homepage não indica login bem-sucedido');
-        return await fazerLoginVouver(username, password, tentativa + 1);
-      }
-      
+
+      userSession.user = username;
+      userSession.pass = password;
+      SESSION_COOKIES = finalCookies;
+
+      await atualizarCache();
+      return true;
     } else {
-      console.error('❌ Login falhou, resposta:', loginResult);
+      console.log('⚠️ Homepage não indica login bem-sucedido, tentando novamente...');
       return await fazerLoginVouver(username, password, tentativa + 1);
     }
-    
+
   } catch (error) {
     console.error(`❌ Erro na tentativa ${tentativa}:`, error.message);
-    
-    if (error.code) {
-      console.error(`   Código do erro: ${error.code}`);
-    }
-    
+    if (error.code) console.error(`   Código do erro: ${error.code}`);
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
+      // Log dos primeiros 300 chars do body para diagnóstico
+      const body = typeof error.response.data === 'string'
+        ? error.response.data.substring(0, 300)
+        : JSON.stringify(error.response.data).substring(0, 300);
+      console.error(`   Body: ${body}`);
     }
-    
-    // Tentar próxima proxy
+
     if (tentativa < MAX_TENTATIVAS) {
-      console.log(`🔄 Tentando próxima proxy...`);
+      console.log(`🔄 Tentando novamente...`);
       return await fazerLoginVouver(username, password, tentativa + 1);
     }
-    
     return false;
   }
 }
@@ -610,7 +651,7 @@ async function atualizarCache() {
               'Accept': 'application/json, text/plain, */*',
               'Referer': `${BASE_URL}/index.php?page=homepage`
             },
-            proxy: getNextProxy(),
+            ...getProxyConfig(),
             timeout: 30000
           }
         );
@@ -760,7 +801,7 @@ async function buscarDetalhes(id, type) {
           ...HEADERS,
           'Cookie': SESSION_COOKIES
         },
-        proxy: getNextProxy(),
+        ...getProxyConfig(),
         timeout: 30000,
         responseType: 'arraybuffer'
       }
@@ -799,7 +840,7 @@ async function buscarDetalhes(id, type) {
             ...HEADERS,
             'Cookie': SESSION_COOKIES
           },
-          proxy: getNextProxy(),
+          ...getProxyConfig(),
           timeout: 30000,
           responseType: 'arraybuffer'
         }
@@ -1476,8 +1517,8 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         movies: CACHE_CONTEUDO.movies.length,
         series: CACHE_CONTEUDO.series.length
       },
-      proxy: 'Proxies Residenciais Brasileiras',
-      proxiesCount: PROXIES_RESIDENCIAIS.length,
+      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
+      proxiesCount: 1,
       session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     
@@ -1599,10 +1640,10 @@ async function iniciarServidor() {
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('⚠️ MODO DEGRADADO ATIVADO');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.error('Login no Vouver falhou após testar todas as proxies.');
+        console.error('Login no Vouver falhou.');
         console.error('Possíveis causas:');
-        console.error('  - Todas as proxies podem estar bloqueadas');
-        console.error('  - Problema de autenticação por IP');
+        console.error('  - Proxy pode estar bloqueada ou inativa');
+        console.error('  - Credenciais inválidas');
         console.error('  - Vouver.me pode estar fora do ar');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         
@@ -1624,11 +1665,11 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - Proxies Residenciais Edition!');
+      console.log('🚀 FastTV Server - Proxy Residencial Edition!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌍 Proxies: ${PROXIES_RESIDENCIAIS.length} Brasileiras Residenciais`);
+      console.log(`🌍 Proxy: ${PROXY_HOST}:${PROXY_PORT} (autenticada)`);
       console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
