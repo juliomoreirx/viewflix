@@ -766,6 +766,89 @@ function limparTexto(texto) {
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
 
+  const isBlockedPage = (html = '') => {
+    const t = String(html).toLowerCase();
+    return (
+      t.includes('you are unable to access') ||
+      t.includes('attention required') ||
+      t.includes('cf-browser-verification') ||
+      t.includes('cloudflare') && t.includes('ray id') ||
+      t.includes('access denied')
+    );
+  };
+
+  const decodeHtml = (buffer) => {
+    let html = null;
+    const encodings = ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1'];
+
+    for (const encoding of encodings) {
+      try {
+        const decoded = iconv.decode(Buffer.from(buffer), encoding);
+        if (!decoded.includes('â€') && !decoded.includes('?â€')) {
+          html = decoded;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!html) {
+      html = iconv.decode(Buffer.from(buffer), 'ISO-8859-1');
+      html = corrigirCaracteresEspeciais(html);
+    }
+
+    return html;
+  };
+
+  // Tenta dois formatos de URL:
+  // 1) /index.php?page=...
+  // 2) /?page=...
+  const fetchDetailHtml = async (detailPage, contentId, refererPage = 'movies') => {
+    const attempts = [
+      {
+        url: `${BASE_URL}/index.php`,
+        config: {
+          params: { page: detailPage, id: contentId }
+        }
+      },
+      {
+        url: `${BASE_URL}/`,
+        config: {
+          params: { page: detailPage, id: contentId }
+        }
+      }
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        const resp = await client.get(attempt.url, {
+          ...attempt.config,
+          headers: {
+            'User-Agent': HEADERS['User-Agent'],
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
+            'Referer': `${BASE_URL}/?page=${refererPage}`
+          },
+          timeout: 30000,
+          responseType: 'arraybuffer',
+          validateStatus: s => s < 500
+        });
+
+        const html = decodeHtml(resp.data);
+
+        if (isBlockedPage(html)) {
+          console.log(`⚠️ Página bloqueada detectada em ${attempt.url} (${detailPage}/${contentId}), tentando fallback...`);
+          continue;
+        }
+
+        return html;
+      } catch (e) {
+        console.log(`⚠️ Falha ao buscar ${detailPage}/${contentId} em ${attempt.url}: ${e.message}`);
+      }
+    }
+
+    return null;
+  };
+
   try {
     // ===== TENTAR VIA CLOUDFLARE WORKER =====
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
@@ -783,7 +866,6 @@ async function buscarDetalhes(id, type) {
         );
 
         const data = response.data;
-
         if (data.success && data.data) {
           console.log('✅ Detalhes obtidos via Worker');
           return data.data;
@@ -793,85 +875,27 @@ async function buscarDetalhes(id, type) {
       }
     }
 
-    // ===== BUSCAR DIRETAMENTE (IP LOCAL) =====
-    console.log(`🌐 Buscando detalhes diretamente (IP local): ${type}/${id}...`);
+    // ===== BUSCAR DIRETAMENTE =====
+    console.log(`🌐 Buscando detalhes diretamente: ${type}/${id}...`);
     await refreshSessionCookiesFromJar();
     await logCurrentCookies(`detalhes-${type}-${id}`);
 
-    const response = await client.get(
-      `${BASE_URL}/index.php`,
-      {
-        params: { page: pageType, id },
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
-          'Referer': `${BASE_URL}/?page=movies`
-        },
-        timeout: 30000,
-        responseType: 'arraybuffer'
-      }
-    );
-
-    let html = null;
-    const encodings = ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1'];
-
-    for (const encoding of encodings) {
-      try {
-        const decoded = iconv.decode(Buffer.from(response.data), encoding);
-        if (!decoded.includes('â€') && !decoded.includes('?â€')) {
-          html = decoded;
-          console.log(`✅ Encoding correto: ${encoding}`);
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
+    let html = await fetchDetailHtml(pageType, id, type === 'movies' ? 'movies' : 'series');
 
     if (!html) {
-      html = iconv.decode(Buffer.from(response.data), 'ISO-8859-1');
-      html = corrigirCaracteresEspeciais(html);
+      console.error(`❌ Não foi possível obter HTML de detalhes (${type}/${id})`);
+      return null;
     }
 
     let $ = cheerio.load(html, { decodeEntities: false });
 
     // Se não encontrou episódios e é série, tentar como filme
     if ($('.tab_episode').length === 0 && type !== 'movies') {
-      const response2 = await client.get(
-        `${BASE_URL}/index.php`,
-        {
-          params: { page: 'moviedetail', id },
-          headers: {
-            'User-Agent': HEADERS['User-Agent'],
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Referer': `${BASE_URL}/?page=series`
-          },
-          timeout: 30000,
-          responseType: 'arraybuffer'
-        }
-      );
+      const html2 = await fetchDetailHtml('moviedetail', id, 'series');
 
-      html = null;
-      for (const encoding of encodings) {
-        try {
-          const decoded = iconv.decode(Buffer.from(response2.data), encoding);
-          if (!decoded.includes('â€') && !decoded.includes('?â€')) {
-            html = decoded;
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
+      if (html2) {
+        $ = cheerio.load(html2, { decodeEntities: false });
       }
-
-      if (!html) {
-        html = iconv.decode(Buffer.from(response2.data), 'ISO-8859-1');
-        html = corrigirCaracteresEspeciais(html);
-      }
-
-      $ = cheerio.load(html, { decodeEntities: false });
     }
 
     const data = { seasons: {}, info: {} };
@@ -905,14 +929,11 @@ async function buscarDetalhes(id, type) {
 
           data.info.duracaoMinutos = (horas * 60) + minutos + Math.ceil(segundos / 60);
           data.info.duracaoTexto = tag;
-
           console.log(`✅ [FILME] Duração: ${tag} = ${data.info.duracaoMinutos}min`);
         }
 
         if (!tag.includes(':') && isNaN(tag) && !/^\d{4}$/.test(tag)) {
-          if (!data.info.genero) {
-            data.info.genero = tag;
-          }
+          if (!data.info.genero) data.info.genero = tag;
         }
       }
     }
@@ -937,6 +958,12 @@ async function buscarDetalhes(id, type) {
       });
     } else {
       data.seasons["Filme"] = [{ name: data.title || "Filme Completo", id }];
+    }
+
+    // Se título vier vazio, normalmente caiu em HTML inesperado
+    if (!data.title || data.title.length < 2) {
+      console.log('⚠️ HTML retornado sem título válido (possível bloqueio/sessão inválida)');
+      return null;
     }
 
     return data;
