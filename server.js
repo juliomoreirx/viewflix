@@ -3,8 +3,6 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
-const { HttpProxyAgent } = require('http-proxy-agent');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 const cheerio = require('cheerio');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -42,30 +40,12 @@ const CLOUDFLARE_WORKER_URL = process.env.CLOUDFLARE_WORKER_URL;
 // Cloudflare clearance cookie (obter do browser logado)
 const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 
-// ===== PROXY RESIDENCIAL (VARIÁVEIS DE AMBIENTE) =====
-const PROXY_HOST = process.env.PROXY_HOST;
-const PROXY_PORT = parseInt(process.env.PROXY_PORT);
-const PROXY_USER = process.env.PROXY_USER;
-const PROXY_PASS = process.env.PROXY_PASS;
+// Sessão pré-autenticada (gerada localmente e colada no .env)
+const SESSION_COOKIES_ENV = process.env.SESSION_COOKIES || '';
 
-// Função que retorna o agent da proxy configurada
-function getNextProxy() {
-  console.log(`🌍 Usando proxy: ${PROXY_HOST}:${PROXY_PORT}`);
-  const proxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
-  return proxyUrl;
+if (CLOUDFLARE_WORKER_URL) {
+  console.log(`☁️ Cloudflare Worker configurado: ${CLOUDFLARE_WORKER_URL}`);
 }
-
-// Retorna o objeto de config axios com o agent correto para HTTP e HTTPS
-function getProxyConfig() {
-  const proxyUrl = getNextProxy();
-  return {
-    httpAgent: new HttpProxyAgent(proxyUrl),   // para destinos http://
-    httpsAgent: new HttpsProxyAgent(proxyUrl), // para destinos https://
-    proxy: false // desativa o handler nativo do axios
-  };
-}
-
-console.log(`🌍 Proxy Residencial Configurada: ${PROXY_HOST}:${PROXY_PORT}`);
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
 const requiredVars = {
@@ -84,10 +64,6 @@ for (const [key, value] of Object.entries(requiredVars)) {
 
 if (!MP_ACCESS_TOKEN) {
   console.warn('⚠️ AVISO: MP_ACCESS_TOKEN não definido - pagamentos PIX não funcionarão');
-}
-
-if (CLOUDFLARE_WORKER_URL) {
-  console.log(`☁️ Cloudflare Worker configurado: ${CLOUDFLARE_WORKER_URL}`);
 }
 
 // ===== LOGS DE INICIALIZAÇÃO =====
@@ -376,8 +352,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 
   try {
     // ── PASSO 1: Carregar página de login e extrair CSRF token + cookies ──
-    // Feito SEM proxy pois o Cloudflare bloqueia proxies no GET inicial
-    console.log('📡 Acessando página de login (sem proxy para evitar CF block)...');
+    console.log('📡 Acessando página de login...');
 
     const loginPageResponse = await axios.get(`${BASE_URL}/index.php?page=login`, {
       headers: {
@@ -388,13 +363,12 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       maxRedirects: 5
     });
     
-    // Log para debug
     console.log(`📄 Status página login: ${loginPageResponse.status}`);
     console.log(`📄 Tamanho HTML: ${loginPageResponse.data.length} chars`);
 
     let cookiesArr = extrairCookies(loginPageResponse.headers['set-cookie']);
 
-    // Injetar cf_clearance do .env se disponível (necessário para passar Cloudflare WAF)
+    // Injetar cf_clearance do .env se disponível
     if (CF_CLEARANCE) {
       const cfIdx = cookiesArr.findIndex(c => c.name === 'cf_clearance');
       if (cfIdx >= 0) cookiesArr[cfIdx].value = CF_CLEARANCE;
@@ -411,7 +385,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     console.log(`🔑 CSRF token: ${csrfToken ? csrfToken.substring(0, 16) + '...' : 'NÃO ENCONTRADO'}`);
     console.log(`🍪 Cookies iniciais: ${cookiesArr.length}`);
 
-    // ── PASSO 2: POST no form HTML (igual ao browser) ──
+    // ── PASSO 2: POST no form HTML ──
     console.log('🚀 Submetendo formulário de login...');
 
     const formData = new URLSearchParams({
@@ -447,7 +421,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 
     cookiesArr = extrairCookies(formResponse.headers['set-cookie'], cookiesArr);
 
-    // ── PASSO 3: AJAX login (endpoint real capturado) ──
+    // ── PASSO 3: AJAX login ──
     console.log('🚀 Fazendo AJAX login...');
 
     const ajaxData = new URLSearchParams({
@@ -529,7 +503,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     if (error.code) console.error(`   Código do erro: ${error.code}`);
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
-      // Log dos primeiros 300 chars do body para diagnóstico
       const body = typeof error.response.data === 'string'
         ? error.response.data.substring(0, 300)
         : JSON.stringify(error.response.data).substring(0, 300);
@@ -544,7 +517,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   }
 }
 
-// ===== FUNÇÃO: ATUALIZAR CACHE (COM WORKER OU PROXIES) =====
+// ===== FUNÇÃO: ATUALIZAR CACHE =====
 
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
@@ -614,7 +587,6 @@ async function atualizarCache() {
             
             console.log(`✅ Cache obtido via Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
             
-            // Salvar em content.json
             try {
               const dataToSave = {
                 status: true,
@@ -637,9 +609,9 @@ async function atualizarCache() {
       }
     }
     
-    // ===== 3. BUSCAR VIA PROXIES RESIDENCIAIS =====
+    // ===== 3. BUSCAR DIRETAMENTE (IP LOCAL) =====
     if (SESSION_COOKIES) {
-      console.log('🌍 Buscando cache via Proxies Residenciais...');
+      console.log('🌐 Buscando cache diretamente (IP local)...');
       
       try {
         const cacheResponse = await axios.get(
@@ -651,7 +623,6 @@ async function atualizarCache() {
               'Accept': 'application/json, text/plain, */*',
               'Referer': `${BASE_URL}/index.php?page=homepage`
             },
-            ...getProxyConfig(),
             timeout: 30000
           }
         );
@@ -673,9 +644,8 @@ async function atualizarCache() {
           CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
           
-          console.log(`✅ Cache obtido via Proxies: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+          console.log(`✅ Cache obtido diretamente: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
           
-          // Salvar em content.json
           try {
             const dataToSave = {
               status: true,
@@ -692,8 +662,8 @@ async function atualizarCache() {
           
           return;
         }
-      } catch (proxyError) {
-        console.error('❌ Erro ao buscar cache via Proxies:', proxyError.message);
+      } catch (directError) {
+        console.error('❌ Erro ao buscar cache diretamente:', directError.message);
       }
     }
     
@@ -758,7 +728,7 @@ function limparTexto(texto) {
   return texto;
 }
 
-// ===== BUSCAR DETALHES (WORKER PRIMEIRO, PROXIES FALLBACK) =====
+// ===== BUSCAR DETALHES =====
 
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
@@ -790,8 +760,8 @@ async function buscarDetalhes(id, type) {
       }
     }
     
-    // ===== BUSCAR VIA PROXIES RESIDENCIAIS =====
-    console.log(`🌍 Buscando detalhes via Proxies: ${type}/${id}...`);
+    // ===== BUSCAR DIRETAMENTE (IP LOCAL) =====
+    console.log(`🌐 Buscando detalhes diretamente (IP local): ${type}/${id}...`);
     
     const response = await axios.get(
       `${BASE_URL}/index.php`,
@@ -801,7 +771,6 @@ async function buscarDetalhes(id, type) {
           ...HEADERS,
           'Cookie': SESSION_COOKIES
         },
-        ...getProxyConfig(),
         timeout: 30000,
         responseType: 'arraybuffer'
       }
@@ -813,7 +782,7 @@ async function buscarDetalhes(id, type) {
     for (const encoding of encodings) {
       try {
         const decoded = iconv.decode(Buffer.from(response.data), encoding);
-        if (!decoded.includes('�') && !decoded.includes('?�')) {
+        if (!decoded.includes('â€') && !decoded.includes('?â€')) {
           html = decoded;
           console.log(`✅ Encoding correto: ${encoding}`);
           break;
@@ -840,7 +809,6 @@ async function buscarDetalhes(id, type) {
             ...HEADERS,
             'Cookie': SESSION_COOKIES
           },
-          ...getProxyConfig(),
           timeout: 30000,
           responseType: 'arraybuffer'
         }
@@ -850,7 +818,7 @@ async function buscarDetalhes(id, type) {
       for (const encoding of encodings) {
         try {
           const decoded = iconv.decode(Buffer.from(response2.data), encoding);
-          if (!decoded.includes('�') && !decoded.includes('?�')) {
+          if (!decoded.includes('â€') && !decoded.includes('?â€')) {
             html = decoded;
             break;
           }
@@ -1018,8 +986,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    proxy: 'Proxies Residenciais Brasileiras',
-    proxiesCount: PROXIES_RESIDENCIAIS.length,
+    network: 'IP local direto',
     cacheSize: {
       movies: CACHE_CONTEUDO.movies.length,
       series: CACHE_CONTEUDO.series.length
@@ -1517,8 +1484,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         movies: CACHE_CONTEUDO.movies.length,
         series: CACHE_CONTEUDO.series.length
       },
-      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
-      proxiesCount: 1,
+      network: 'IP local direto',
       session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     
@@ -1632,21 +1598,27 @@ setInterval(async () => {
 
 async function iniciarServidor() {
   try {
-    if (LOGIN_USER && LOGIN_PASS) {
-      console.log('🔐 Fazendo login automático no Vouver...');
+    // ===== SESSÃO VIA .ENV (prioritário — evita login via Cloudflare) =====
+    if (SESSION_COOKIES_ENV) {
+      console.log('🍪 SESSION_COOKIES encontrado no .env — pulando login...');
+      SESSION_COOKIES = SESSION_COOKIES_ENV;
+      userSession.user = LOGIN_USER;
+      userSession.pass = LOGIN_PASS;
+      console.log('✅ Sessão carregada do .env com sucesso!');
+      await atualizarCache();
+    } else if (LOGIN_USER && LOGIN_PASS) {
+      // Fallback: tentar login normal (só funciona em IP residencial)
+      console.log('🔐 SESSION_COOKIES não definido — tentando login automático...');
       const loginSucesso = await fazerLoginVouver(LOGIN_USER, LOGIN_PASS);
       
       if (!loginSucesso) {
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('⚠️ MODO DEGRADADO ATIVADO');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.error('Login no Vouver falhou.');
-        console.error('Possíveis causas:');
-        console.error('  - Proxy pode estar bloqueada ou inativa');
-        console.error('  - Credenciais inválidas');
-        console.error('  - Vouver.me pode estar fora do ar');
+        console.error('Login falhou e SESSION_COOKIES não definido.');
+        console.error('Solução: rode capturar-cookies.js localmente');
+        console.error('e cole SESSION_COOKIES=... no .env do servidor.');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        
         userSession.user = LOGIN_USER;
         userSession.pass = LOGIN_PASS;
       }
@@ -1665,11 +1637,11 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - Proxy Residencial Edition!');
+      console.log('🚀 FastTV Server - IP Local Edition!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌍 Proxy: ${PROXY_HOST}:${PROXY_PORT} (autenticada)`);
+      console.log(`🌐 Rede: IP local direto (sem proxy)`);
       console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
