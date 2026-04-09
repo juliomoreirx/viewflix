@@ -12,6 +12,7 @@ const iconv = require('iconv-lite');
 const { CookieJar } = require('tough-cookie');
 const { wrapper } = require('axios-cookiejar-support');
 const mongoose = require('mongoose');
+const { HttpProxyAgent } = require('http-proxy-agent');
 
 // ===== IMPORTA BOT DO TELEGRAM =====
 const telegramBot = require('./telegram-bot');
@@ -42,6 +43,22 @@ const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 
 // Sessão pré-autenticada (gerada localmente e colada no .env)
 const SESSION_COOKIES_ENV = process.env.SESSION_COOKIES || '';
+
+// ===== PROXY RESIDENCIAL =====
+const RES_PROXY_ENABLED = String(process.env.RES_PROXY_ENABLED || 'false').toLowerCase() === 'true';
+const RES_PROXY_HOST = process.env.RES_PROXY_HOST || '';
+const RES_PROXY_PORT = parseInt(process.env.RES_PROXY_PORT || '0', 10);
+const RES_PROXY_USER = process.env.RES_PROXY_USER || '';
+const RES_PROXY_PASS = process.env.RES_PROXY_PASS || '';
+
+let residentialProxyAgent = null;
+if (RES_PROXY_ENABLED && RES_PROXY_HOST && RES_PROXY_PORT && RES_PROXY_USER && RES_PROXY_PASS) {
+  const proxyUrl = `http://${encodeURIComponent(RES_PROXY_USER)}:${encodeURIComponent(RES_PROXY_PASS)}@${RES_PROXY_HOST}:${RES_PROXY_PORT}`;
+  residentialProxyAgent = new HttpProxyAgent(proxyUrl);
+  console.log(`🏠 Proxy residencial ativada: ${RES_PROXY_HOST}:${RES_PROXY_PORT}`);
+} else {
+  console.log('ℹ️ Proxy residencial inativa');
+}
 
 if (CLOUDFLARE_WORKER_URL) {
   console.log(`☁️ Cloudflare Worker configurado: ${CLOUDFLARE_WORKER_URL}`);
@@ -184,6 +201,34 @@ let userSession = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
 let SESSION_COOKIES = '';
 
+// ===== HELPERS PROXY =====
+function shouldUseResidentialProxy(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return (
+      host === 'vouver.me' ||
+      host.endsWith('.vouver.me') ||
+      host === 'goplay.icu' ||
+      host.endsWith('.goplay.icu')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function withOptionalResidentialProxy(axiosConfig = {}, url = '') {
+  if (residentialProxyAgent && shouldUseResidentialProxy(url)) {
+    return {
+      ...axiosConfig,
+      httpAgent: residentialProxyAgent,
+      httpsAgent: residentialProxyAgent,
+      proxy: false
+    };
+  }
+  return axiosConfig;
+}
+
 // ===== FUNÇÕES DE COOKIES (PATCH) =====
 async function hydrateJarFromCookieString(cookieStr, baseUrl) {
   if (!cookieStr) return;
@@ -196,6 +241,9 @@ async function hydrateJarFromCookieString(cookieStr, baseUrl) {
     const value = part.substring(idx + 1).trim();
     try {
       await jar.setCookie(`${name}=${value}; Path=/`, baseUrl);
+      // também seta no https para evitar mismatch de esquema
+      const httpsBase = baseUrl.replace(/^http:\/\//i, 'https://');
+      await jar.setCookie(`${name}=${value}; Path=/`, httpsBase);
     } catch (e) {
       console.log(`⚠️ Falha ao setar cookie no jar: ${name}`);
     }
@@ -204,8 +252,13 @@ async function hydrateJarFromCookieString(cookieStr, baseUrl) {
 
 async function refreshSessionCookiesFromJar() {
   try {
-    const cookies = await jar.getCookies(BASE_URL);
-    SESSION_COOKIES = cookies.map(c => `${c.key}=${c.value}`).join('; ');
+    const cookiesHttp = await jar.getCookies(BASE_URL);
+    const cookiesHttps = await jar.getCookies(BASE_URL.replace(/^http:\/\//i, 'https://'));
+    const merged = new Map();
+
+    [...cookiesHttp, ...cookiesHttps].forEach(c => merged.set(c.key, c.value));
+    SESSION_COOKIES = Array.from(merged.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+
     return SESSION_COOKIES;
   } catch (e) {
     console.error('❌ Erro ao ler cookies do jar:', e.message);
@@ -247,9 +300,7 @@ function encryptData(data, secret) {
 function decryptData(encrypted, secret) {
   try {
     const parts = encrypted.split(':');
-    if (parts.length !== 2) {
-      return null;
-    }
+    if (parts.length !== 2) return null;
 
     const iv = Buffer.from(parts[0], 'hex');
     const encryptedData = parts[1];
@@ -274,9 +325,7 @@ async function advancedRateLimit(req, res, next) {
   try {
     let limiter = await RateLimit.findOne({ identifier });
 
-    if (!limiter) {
-      limiter = new RateLimit({ identifier, requests: [] });
-    }
+    if (!limiter) limiter = new RateLimit({ identifier, requests: [] });
 
     if (limiter.blocked && limiter.blockedUntil > now) {
       return res.status(429).json({
@@ -287,7 +336,6 @@ async function advancedRateLimit(req, res, next) {
 
     const sixtySecondsAgo = new Date(now.getTime() - 60000);
     limiter.requests = limiter.requests.filter(r => r.timestamp > sixtySecondsAgo);
-
     limiter.requests.push({ timestamp: now, videoId: req.params.token });
 
     if (limiter.requests.length > 100) {
@@ -296,7 +344,6 @@ async function advancedRateLimit(req, res, next) {
       await limiter.save();
 
       console.log(`🚫 IP bloqueado por excesso de requisições: ${identifier}`);
-
       return res.status(429).json({
         error: 'Rate limit exceeded. Blocked for 15 minutes.',
         retryAfter: 900
@@ -346,15 +393,12 @@ function strictCORS(req, res, next) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Stream-Token, X-Encrypted-Data');
   res.setHeader('Access-Control-Max-Age', '600');
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
 
   next();
 }
 
 // ===== FUNÇÃO AUXILIAR: EXTRAIR E MESCLAR COOKIES =====
-
 function extrairCookies(setCookieHeader, cookiesArray = []) {
   const cookies = [...cookiesArray];
   (setCookieHeader || []).forEach(cookieStr => {
@@ -376,7 +420,6 @@ function cookieString(arr) {
 }
 
 // ===== FUNÇÃO DE LOGIN =====
-
 async function fazerLoginVouver(username, password, tentativa = 1) {
   const MAX_TENTATIVAS = 3;
 
@@ -389,33 +432,33 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
   console.log(`👤 Usuário: ${username}`);
 
   try {
-    // Reinicia jar por tentativa (reduz lixo de sessão quebrada)
     await jar.removeAllCookies();
 
-    // Injeta cf_clearance se houver
     if (CF_CLEARANCE) {
       await jar.setCookie(`cf_clearance=${CF_CLEARANCE}; Path=/`, BASE_URL);
+      await jar.setCookie(`cf_clearance=${CF_CLEARANCE}; Path=/`, BASE_URL.replace(/^http:\/\//i, 'https://'));
       console.log('🛡️ cf_clearance injetado no CookieJar');
     } else {
       console.log('⚠️ CF_CLEARANCE não definido no .env — pode falhar no WAF');
     }
 
-    // ── PASSO 1: Carregar página de login e extrair CSRF token ──
     console.log('📡 Acessando página de login...');
-
-    const loginPageResponse = await client.get(`${BASE_URL}/index.php?page=login`, {
-      headers: {
-        ...HEADERS,
-        'Sec-Fetch-Site': 'none'
-      },
-      timeout: 30000,
-      maxRedirects: 5
-    });
+    const loginUrl = `${BASE_URL}/index.php?page=login`;
+    const loginPageResponse = await client.get(
+      loginUrl,
+      withOptionalResidentialProxy({
+        headers: {
+          ...HEADERS,
+          'Sec-Fetch-Site': 'none'
+        },
+        timeout: 30000,
+        maxRedirects: 5
+      }, loginUrl)
+    );
 
     console.log(`📄 Status página login: ${loginPageResponse.status}`);
     console.log(`📄 Tamanho HTML: ${String(loginPageResponse.data || '').length} chars`);
 
-    // Extrair CSRF token do HTML
     const htmlPage = loginPageResponse.data;
     const csrfMatch =
       htmlPage.match(/name=["']csrf_token["']\s+value=["']([\w-]+)["']/i) ||
@@ -424,25 +467,23 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     const csrfToken = csrfMatch ? csrfMatch[1] : '';
 
     console.log(`🔑 CSRF token: ${csrfToken ? csrfToken.substring(0, 16) + '...' : 'NÃO ENCONTRADO'}`);
-
     await logCurrentCookies('login-page');
 
-    // ── PASSO 2: POST no form HTML ──
     console.log('🚀 Submetendo formulário de login...');
-
     const formData = new URLSearchParams({
-      'username': username,
-      'sifre': password,
-      'beni_hatirla': 'on',
-      'csrf_token': csrfToken,
-      'recaptcha_response': '',
-      'login': 'Acessar'
+      username,
+      sifre: password,
+      beni_hatirla: 'on',
+      csrf_token: csrfToken,
+      recaptcha_response: '',
+      login: 'Acessar'
     });
 
+    const loginPostUrl = `${BASE_URL}/index.php?page=login`;
     await client.post(
-      `${BASE_URL}/index.php?page=login`,
+      loginPostUrl,
       formData.toString(),
-      {
+      withOptionalResidentialProxy({
         headers: {
           ...HEADERS,
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -457,23 +498,22 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         timeout: 30000,
         maxRedirects: 5,
         validateStatus: s => s < 500
-      }
+      }, loginPostUrl)
     );
 
-    // ── PASSO 3: AJAX login ──
     console.log('🚀 Fazendo AJAX login...');
-
     const ajaxData = new URLSearchParams({
-      'username': username,
-      'password': password,
-      'csrf_token': csrfToken,
-      'type': '1'
+      username,
+      password,
+      csrf_token: csrfToken,
+      type: '1'
     });
 
+    const ajaxUrl = `${BASE_URL}/ajax/login.php`;
     const ajaxResponse = await client.post(
-      `${BASE_URL}/ajax/login.php`,
+      ajaxUrl,
       ajaxData.toString(),
-      {
+      withOptionalResidentialProxy({
         headers: {
           ...HEADERS,
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -487,17 +527,16 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         timeout: 30000,
         maxRedirects: 5,
         validateStatus: s => s < 500
-      }
+      }, ajaxUrl)
     );
 
     console.log('📊 Resposta AJAX:', ajaxResponse.data);
 
-    // ── PASSO 4: Verificar homepage ──
     console.log('📡 Verificando login na homepage...');
-
+    const homepageUrl = `${BASE_URL}/index.php?page=homepage`;
     const homepageResponse = await client.get(
-      `${BASE_URL}/index.php?page=homepage`,
-      {
+      homepageUrl,
+      withOptionalResidentialProxy({
         headers: {
           ...HEADERS,
           'Referer': `${BASE_URL}/index.php?page=login`,
@@ -507,11 +546,10 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         },
         timeout: 30000,
         maxRedirects: 5
-      }
+      }, homepageUrl)
     );
 
     const homepageHtml = homepageResponse.data;
-
     if (homepageHtml.includes('Meu Perfil') || homepageHtml.includes('Sair') || homepageHtml.includes('sair')) {
       console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
 
@@ -522,7 +560,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       await logCurrentCookies('login-sucesso');
 
       console.log(`🍪 SESSION_COOKIES atualizado (${SESSION_COOKIES.length} chars)`);
-
       await atualizarCache();
       return true;
     } else {
@@ -550,14 +587,13 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 }
 
 // ===== FUNÇÃO: ATUALIZAR CACHE =====
-
 async function atualizarCache() {
   console.log("🔄 Atualizando cache de conteúdo...");
 
   try {
-    // ===== 1. TENTAR ARQUIVO LOCAL PRIMEIRO =====
     const contentPath = path.join(__dirname, 'content.json');
 
+    // 1) arquivo local
     if (fs.existsSync(contentPath)) {
       console.log('📦 Carregando catálogo do arquivo content.json...');
 
@@ -588,7 +624,7 @@ async function atualizarCache() {
       }
     }
 
-    // ===== 2. TENTAR VIA CLOUDFLARE WORKER =====
+    // 2) worker
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
 
@@ -600,7 +636,6 @@ async function atualizarCache() {
         );
 
         const data = response.data;
-
         if (data.success && data.data) {
           let rawMovies = [], rawSeries = [];
 
@@ -629,7 +664,7 @@ async function atualizarCache() {
 
               fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
               console.log('💾 Cache salvo em content.json');
-            } catch (saveError) {
+            } catch {
               console.log('⚠️ Não foi possível salvar content.json');
             }
 
@@ -641,29 +676,29 @@ async function atualizarCache() {
       }
     }
 
-    // ===== 3. BUSCAR DIRETAMENTE (IP LOCAL) =====
+    // 3) direto (com proxy opcional)
     if (SESSION_COOKIES) {
-      console.log('🌐 Buscando cache diretamente (IP local)...');
+      console.log('🌐 Buscando cache diretamente...');
 
       try {
         await refreshSessionCookiesFromJar();
 
+        const searchUrl = `${BASE_URL}/app/_search.php?q=a`;
         const cacheResponse = await client.get(
-          `${BASE_URL}/app/_search.php?q=a`,
-          {
+          searchUrl,
+          withOptionalResidentialProxy({
             headers: {
               'User-Agent': HEADERS['User-Agent'],
               'Accept': 'application/json, text/plain, */*',
               'Referer': `${BASE_URL}/index.php?page=homepage`
             },
             timeout: 30000
-          }
+          }, searchUrl)
         );
 
         const cacheData = cacheResponse.data;
 
         let rawMovies = [], rawSeries = [];
-
         if (cacheData.data) {
           rawMovies = cacheData.data.movies || [];
           rawSeries = cacheData.data.series || [];
@@ -689,7 +724,7 @@ async function atualizarCache() {
 
             fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
             console.log('💾 Cache salvo em content.json');
-          } catch (saveError) {
+          } catch {
             console.log('⚠️ Não foi possível salvar content.json');
           }
 
@@ -701,14 +736,12 @@ async function atualizarCache() {
     }
 
     console.error("⚠️ Cache não pôde ser carregado");
-
   } catch (error) {
     console.error("❌ Erro ao atualizar cache:", error.message);
   }
 }
 
 // ===== FUNÇÃO: CORRIGIR CARACTERES ESPECIAIS =====
-
 function corrigirCaracteresEspeciais(html) {
   const entitiesMap = {
     '&#231;': 'ç', '&#233;': 'é', '&#225;': 'á', '&#227;': 'ã',
@@ -733,12 +766,10 @@ function corrigirCaracteresEspeciais(html) {
 }
 
 // ===== FUNÇÃO: LIMPAR TEXTO =====
-
 function limparTexto(texto) {
   if (!texto) return '';
 
   texto = texto.trim().replace(/\s+/g, ' ');
-
   texto = texto
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
@@ -762,7 +793,6 @@ function limparTexto(texto) {
 }
 
 // ===== BUSCAR DETALHES =====
-
 async function buscarDetalhes(id, type) {
   let pageType = type === 'movies' ? 'moviedetail' : 'seriesdetail';
 
@@ -772,7 +802,7 @@ async function buscarDetalhes(id, type) {
       t.includes('you are unable to access') ||
       t.includes('attention required') ||
       t.includes('cf-browser-verification') ||
-      t.includes('cloudflare') && t.includes('ray id') ||
+      (t.includes('cloudflare') && t.includes('ray id')) ||
       t.includes('access denied')
     );
   };
@@ -799,39 +829,29 @@ async function buscarDetalhes(id, type) {
     return html;
   };
 
-  // Tenta dois formatos de URL:
-  // 1) /index.php?page=...
-  // 2) /?page=...
   const fetchDetailHtml = async (detailPage, contentId, refererPage = 'movies') => {
     const attempts = [
-      {
-        url: `${BASE_URL}/index.php`,
-        config: {
-          params: { page: detailPage, id: contentId }
-        }
-      },
-      {
-        url: `${BASE_URL}/`,
-        config: {
-          params: { page: detailPage, id: contentId }
-        }
-      }
+      { url: `${BASE_URL}/index.php`, config: { params: { page: detailPage, id: contentId } } },
+      { url: `${BASE_URL}/`,        config: { params: { page: detailPage, id: contentId } } }
     ];
 
     for (const attempt of attempts) {
       try {
-        const resp = await client.get(attempt.url, {
-          ...attempt.config,
-          headers: {
-            'User-Agent': HEADERS['User-Agent'],
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Referer': `${BASE_URL}/?page=${refererPage}`
-          },
-          timeout: 30000,
-          responseType: 'arraybuffer',
-          validateStatus: s => s < 500
-        });
+        const resp = await client.get(
+          attempt.url,
+          withOptionalResidentialProxy({
+            ...attempt.config,
+            headers: {
+              'User-Agent': HEADERS['User-Agent'],
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
+              'Referer': `${BASE_URL}/?page=${refererPage}`
+            },
+            timeout: 30000,
+            responseType: 'arraybuffer',
+            validateStatus: s => s < 500
+          }, attempt.url)
+        );
 
         const html = decodeHtml(resp.data);
 
@@ -850,32 +870,46 @@ async function buscarDetalhes(id, type) {
   };
 
   try {
-    // ===== TENTAR VIA CLOUDFLARE WORKER =====
+    // Worker primeiro
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log(`🔍 Buscando detalhes via Worker: ${type}/${id}...`);
 
       try {
         const response = await axios.post(
           `${CLOUDFLARE_WORKER_URL}/details-direct`,
-          {
-            id: id,
-            type: type,
-            cookies: SESSION_COOKIES
-          },
+          { id, type, cookies: SESSION_COOKIES },
           { timeout: 15000 }
         );
 
         const data = response.data;
         if (data.success && data.data) {
-          console.log('✅ Detalhes obtidos via Worker');
-          return data.data;
+          const d = data.data;
+          const titulo = String(d.title || '').toLowerCase();
+          const sinopse = String(d.info?.sinopse || '').toLowerCase();
+
+          const bloqueado =
+            titulo.includes('you are unable to access') ||
+            titulo.includes('access denied') ||
+            titulo.includes('attention required') ||
+            titulo.includes('cloudflare') ||
+            sinopse.includes('you are unable to access') ||
+            sinopse.includes('cloudflare');
+
+          const invalido = !d.title || d.title.length < 2 || (!d.seasons && !d.info);
+
+          if (!bloqueado && !invalido) {
+            console.log('✅ Detalhes obtidos via Worker');
+            return d;
+          }
+
+          console.log('⚠️ Worker retornou conteúdo inválido/bloqueio, tentando direto...');
         }
       } catch (workerError) {
         console.log('⚠️ Worker falhou:', workerError.message);
       }
     }
 
-    // ===== BUSCAR DIRETAMENTE =====
+    // Direto
     console.log(`🌐 Buscando detalhes diretamente: ${type}/${id}...`);
     await refreshSessionCookiesFromJar();
     await logCurrentCookies(`detalhes-${type}-${id}`);
@@ -889,13 +923,9 @@ async function buscarDetalhes(id, type) {
 
     let $ = cheerio.load(html, { decodeEntities: false });
 
-    // Se não encontrou episódios e é série, tentar como filme
     if ($('.tab_episode').length === 0 && type !== 'movies') {
       const html2 = await fetchDetailHtml('moviedetail', id, 'series');
-
-      if (html2) {
-        $ = cheerio.load(html2, { decodeEntities: false });
-      }
+      if (html2) $ = cheerio.load(html2, { decodeEntities: false });
     }
 
     const data = { seasons: {}, info: {} };
@@ -912,14 +942,10 @@ async function buscarDetalhes(id, type) {
 
       const imdbText = limparTexto($('.left-wrap .rnd').first().text());
       const imdbMatch = imdbText.match(/IMDB\s+([\d.]+)/i);
-      if (imdbMatch) {
-        data.info.imdb = parseFloat(imdbMatch[1]);
-      }
+      if (imdbMatch) data.info.imdb = parseFloat(imdbMatch[1]);
 
       for (const tag of tags) {
-        if (/^\d{4}$/.test(tag)) {
-          data.info.ano = parseInt(tag);
-        }
+        if (/^\d{4}$/.test(tag)) data.info.ano = parseInt(tag);
 
         const duracaoMatch = tag.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
         if (duracaoMatch) {
@@ -946,21 +972,15 @@ async function buscarDetalhes(id, type) {
         $(el).find('a.ep-list-min').each((j, link) => {
           const epId = $(link).attr('data-id');
           const epName = limparTexto($(link).find('.ep-title').text());
-
-          if (epId && epName) {
-            episodes.push({ name: epName, id: epId });
-          }
+          if (epId && epName) episodes.push({ name: epName, id: epId });
         });
 
-        if (episodes.length > 0) {
-          data.seasons[seasonNum] = episodes;
-        }
+        if (episodes.length > 0) data.seasons[seasonNum] = episodes;
       });
     } else {
       data.seasons["Filme"] = [{ name: data.title || "Filme Completo", id }];
     }
 
-    // Se título vier vazio, normalmente caiu em HTML inesperado
     if (!data.title || data.title.length < 2) {
       console.log('⚠️ HTML retornado sem título válido (possível bloqueio/sessão inválida)');
       return null;
@@ -974,7 +994,6 @@ async function buscarDetalhes(id, type) {
 }
 
 // ===== ESTIMAR DURAÇÃO =====
-
 async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
   try {
     if (mediaType === 'movie' && duracaoDoHTML && duracaoDoHTML > 0) {
@@ -1007,17 +1026,22 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
     const url = `${base}/${userSession.user}/${userSession.pass}/${id}.mp4`;
 
     try {
-      const headResponse = await client.head(url, {
-        headers: {
-          'User-Agent': HEADERS['User-Agent'],
-          'Referer': BASE_URL,
-          'Accept': '*/*'
-        },
-        timeout: 10000,
-        maxRedirects: 5
-      });
+      // 1) tenta HEAD
+      const headResponse = await client.head(
+        url,
+        withOptionalResidentialProxy({
+          headers: {
+            'User-Agent': HEADERS['User-Agent'],
+            'Referer': BASE_URL,
+            'Accept': '*/*'
+          },
+          timeout: 10000,
+          maxRedirects: 5,
+          validateStatus: s => s < 500
+        }, url)
+      );
 
-      const contentLength = parseInt(headResponse.headers['content-length'] || '0');
+      let contentLength = parseInt(headResponse.headers['content-length'] || '0');
 
       if (contentLength > 0) {
         const minutos = Math.round(contentLength / (1024 * 1024 * 15));
@@ -1032,14 +1056,68 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
         console.log(`✅ Duração via HEAD: ${duracaoFinal}min`);
         return duracaoFinal;
       }
+
+      throw new Error('HEAD sem content-length');
     } catch (headError) {
-      console.log(`⚠️ HEAD falhou: ${headError.message}`);
+      console.log(`⚠️ HEAD falhou (${headError.message}), tentando GET Range...`);
+
+      try {
+        // 2) fallback GET parcial
+        const rangeResponse = await client.get(
+          url,
+          withOptionalResidentialProxy({
+            headers: {
+              'User-Agent': HEADERS['User-Agent'],
+              'Referer': BASE_URL,
+              'Accept': '*/*',
+              'Range': 'bytes=0-0'
+            },
+            timeout: 12000,
+            maxRedirects: 5,
+            responseType: 'stream',
+            validateStatus: s => s < 500
+          }, url)
+        );
+
+        if (rangeResponse.data && typeof rangeResponse.data.destroy === 'function') {
+          rangeResponse.data.destroy();
+        }
+
+        let totalBytes = 0;
+
+        const cr = rangeResponse.headers['content-range']; // ex: bytes 0-0/123456789
+        if (cr) {
+          const m = String(cr).match(/\/(\d+)$/);
+          if (m) totalBytes = parseInt(m[1], 10);
+        }
+
+        if (!totalBytes) {
+          totalBytes = parseInt(rangeResponse.headers['content-length'] || '0');
+        }
+
+        if (totalBytes > 0) {
+          const minutos = Math.round(totalBytes / (1024 * 1024 * 15));
+          const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
+
+          await AssetSize.findOneAndUpdate(
+            { assetId: id, mediaType: mediaType === 'movie' ? 'movie' : 'series_ep' },
+            { bytes: totalBytes, updatedAt: new Date() },
+            { upsert: true, new: true }
+          );
+
+          console.log(`✅ Duração via GET Range: ${duracaoFinal}min`);
+          return duracaoFinal;
+        }
+
+        console.log('⚠️ GET Range sem tamanho utilizável');
+      } catch (rangeErr) {
+        console.log(`⚠️ GET Range falhou: ${rangeErr.message}`);
+      }
     }
 
     const duracaoPadrao = mediaType === 'movie' ? 110 : 42;
     console.log(`⚠️ Usando duração padrão: ${duracaoPadrao}min`);
     return duracaoPadrao;
-
   } catch (error) {
     console.error(`❌ Erro ao estimar duração: ${error.message}`);
     return mediaType === 'movie' ? 110 : 42;
@@ -1052,7 +1130,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    network: 'IP local direto',
+    network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto',
     cacheSize: {
       movies: CACHE_CONTEUDO.movies.length,
       series: CACHE_CONTEUDO.series.length
@@ -1162,18 +1240,11 @@ app.get('/player/:token', async (req, res) => {
 
     const purchase = await PurchasedContent.findOne({ token: req.params.token });
 
-    if (!purchase) {
-      throw new Error('Conteúdo não encontrado');
-    }
-
-    if (new Date() > purchase.expiresAt) {
-      throw new Error('Link expirado');
-    }
+    if (!purchase) throw new Error('Conteúdo não encontrado');
+    if (new Date() > purchase.expiresAt) throw new Error('Link expirado');
 
     const user = await User.findOne({ userId });
-    if (!user || user.isBlocked) {
-      throw new Error('Usuário bloqueado');
-    }
+    if (!user || user.isBlocked) throw new Error('Usuário bloqueado');
 
     purchase.viewed = true;
     purchase.viewCount += 1;
@@ -1188,126 +1259,31 @@ app.get('/player/:token', async (req, res) => {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${purchase.title} - FastTV</title>
-
     <link href="https://vjs.zencdn.net/8.10.0/video-js.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-
         body {
             background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            color: #fff;
-            user-select: none;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            min-height: 100vh; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #fff; user-select: none;
         }
-
         .container { width: 100%; max-width: 1400px; padding: 20px; position: relative; }
-
-        .logo {
-            color: #E50914;
-            font-size: 36px;
-            font-weight: bold;
-            text-align: center;
-            margin-bottom: 30px;
-            text-shadow: 0 0 20px rgba(229, 9, 20, 0.5);
-        }
-
-        .video-wrapper {
-            position: relative;
-            width: 100%;
-            background: #000;
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.8);
-        }
-
-        .video-js {
-            width: 100%;
-            height: 80vh;
-            font-family: 'Segoe UI', Arial, sans-serif;
-        }
-
-        .vjs-theme-fasttv .vjs-control-bar {
-            background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0.7) 50%, transparent 100%);
-            height: 4em;
-        }
-
-        .vjs-theme-fasttv .vjs-big-play-button {
-            background: rgba(229, 9, 20, 0.9);
-            border: none;
-            border-radius: 50%;
-            width: 2em;
-            height: 2em;
-            line-height: 2em;
-            font-size: 3em;
-            left: 50%;
-            top: 50%;
-            transform: translate(-50%, -50%);
-            transition: all 0.3s;
-        }
-
-        .vjs-theme-fasttv .vjs-big-play-button:hover {
-            background: rgba(229, 9, 20, 1);
-            transform: translate(-50%, -50%) scale(1.1);
-        }
-
-        .vjs-theme-fasttv .vjs-play-progress {
-            background-color: #E50914;
-        }
-
-        .vjs-theme-fasttv .vjs-volume-level {
-            background-color: #E50914;
-        }
-
-        .info-bar {
-            background: rgba(20,20,20,0.95);
-            backdrop-filter: blur(10px);
-            padding: 20px;
-            border-radius: 12px;
-            margin-top: 20px;
-            border: 1px solid rgba(255,255,255,0.1);
-        }
-
+        .logo { color: #E50914; font-size: 36px; font-weight: bold; text-align: center; margin-bottom: 30px; text-shadow: 0 0 20px rgba(229, 9, 20, 0.5); }
+        .video-wrapper { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.8); }
+        .video-js { width: 100%; height: 80vh; font-family: 'Segoe UI', Arial, sans-serif; }
+        .vjs-theme-fasttv .vjs-control-bar { background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0.7) 50%, transparent 100%); height: 4em; }
+        .vjs-theme-fasttv .vjs-big-play-button { background: rgba(229, 9, 20, 0.9); border: none; border-radius: 50%; width: 2em; height: 2em; line-height: 2em; font-size: 3em; left: 50%; top: 50%; transform: translate(-50%, -50%); transition: all 0.3s; }
+        .vjs-theme-fasttv .vjs-big-play-button:hover { background: rgba(229, 9, 20, 1); transform: translate(-50%, -50%) scale(1.1); }
+        .vjs-theme-fasttv .vjs-play-progress { background-color: #E50914; }
+        .vjs-theme-fasttv .vjs-volume-level { background-color: #E50914; }
+        .info-bar { background: rgba(20,20,20,0.95); backdrop-filter: blur(10px); padding: 20px; border-radius: 12px; margin-top: 20px; border: 1px solid rgba(255,255,255,0.1); }
         .title { font-size: 24px; font-weight: bold; margin-bottom: 10px; color: #fff; }
-
-        .meta {
-            display: flex;
-            gap: 20px;
-            flex-wrap: wrap;
-            font-size: 14px;
-            color: #aaa;
-            margin-bottom: 15px;
-        }
-
+        .meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 14px; color: #aaa; margin-bottom: 15px; }
         .meta span { display: flex; align-items: center; gap: 8px; }
-
-        .warning {
-            text-align: center;
-            margin-top: 20px;
-            padding: 15px;
-            background: rgba(229, 9, 20, 0.1);
-            border-radius: 8px;
-            font-size: 14px;
-            border: 1px solid rgba(229, 9, 20, 0.3);
-        }
-
-        .timer {
-            display: inline-block;
-            background: rgba(229, 9, 20, 0.2);
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-weight: bold;
-        }
-
-        @media (max-width: 768px) {
-            .video-js { height: 50vh; }
-        }
+        .warning { text-align: center; margin-top: 20px; padding: 15px; background: rgba(229, 9, 20, 0.1); border-radius: 8px; font-size: 14px; border: 1px solid rgba(229, 9, 20, 0.3); }
+        .timer { display: inline-block; background: rgba(229, 9, 20, 0.2); padding: 5px 12px; border-radius: 20px; font-weight: bold; }
+        @media (max-width: 768px) { .video-js { height: 50vh; } }
     </style>
 </head>
 <body>
@@ -1315,17 +1291,8 @@ app.get('/player/:token', async (req, res) => {
         <div class="logo">FAST<span style="color: #fff">TV</span></div>
 
         <div class="video-wrapper">
-            <video
-                id="player"
-                class="video-js vjs-theme-fasttv vjs-big-play-centered"
-                controls
-                preload="auto"
-                data-setup='{
-                    "fluid": true,
-                    "aspectRatio": "16:9",
-                    "playbackRates": [0.5, 0.75, 1, 1.25, 1.5, 2]
-                }'
-            >
+            <video id="player" class="video-js vjs-theme-fasttv vjs-big-play-centered" controls preload="auto"
+                data-setup='{"fluid": true, "aspectRatio": "16:9", "playbackRates": [0.5, 0.75, 1, 1.25, 1.5, 2]}'>
                 <source src="${streamPath}" type="video/mp4">
             </video>
         </div>
@@ -1347,18 +1314,13 @@ app.get('/player/:token', async (req, res) => {
     </div>
 
     <script src="https://vjs.zencdn.net/8.10.0/video.min.js"></script>
-
     <script>
         const expiresAt = new Date('${purchase.expiresAt.toISOString()}');
         let player;
 
         document.addEventListener('DOMContentLoaded', function() {
             player = videojs('player');
-
-            player.el().addEventListener('contextmenu', function(e) {
-                e.preventDefault();
-                return false;
-            });
+            player.el().addEventListener('contextmenu', function(e) { e.preventDefault(); return false; });
 
             let playLogged = false;
             player.on('play', function() {
@@ -1384,16 +1346,12 @@ app.get('/player/:token', async (req, res) => {
 
             if (diff <= 0) {
                 document.getElementById('countdown').innerText = 'EXPIRADO';
-                if (player) {
-                    player.pause();
-                    player.dispose();
-                }
+                if (player) { player.pause(); player.dispose(); }
                 return;
             }
 
             const hours = Math.floor(diff / (1000 * 60 * 60));
             const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
             document.getElementById('countdown').innerText = hours + 'h ' + minutes + 'm';
         }
 
@@ -1412,16 +1370,7 @@ app.get('/player/:token', async (req, res) => {
     <meta charset="UTF-8">
     <title>Acesso Negado - FastTV</title>
     <style>
-        body {
-            background: #0a0a0a;
-            color: #fff;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            font-family: Arial, sans-serif;
-            text-align: center;
-        }
+        body { background: #0a0a0a; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: Arial, sans-serif; text-align: center; }
         .error { max-width: 600px; padding: 40px; }
         h1 { color: #E50914; margin-bottom: 20px; }
     </style>
@@ -1449,10 +1398,7 @@ app.get('/api/stream-secure/:token/:sessionToken',
       const decoded = jwt.verify(contentToken, JWT_SECRET);
       const { videoId, mediaType, userId } = decoded;
 
-      const purchase = await PurchasedContent.findOne({
-        token: contentToken,
-        sessionToken: sessionToken
-      });
+      const purchase = await PurchasedContent.findOne({ token: contentToken, sessionToken });
 
       if (!purchase || new Date() > purchase.expiresAt) {
         console.log('⚠️ Conteúdo expirado ou não encontrado');
@@ -1473,22 +1419,23 @@ app.get('/api/stream-secure/:token/:sessionToken',
 
       console.log(`🎬 Streaming: ${videoId} | User: ${userId}`);
 
-      const response = await client.get(videoUrl, {
-        method: 'GET',
-        responseType: 'stream',
-        headers: {
-          Range: req.headers.range,
-          'User-Agent': HEADERS['User-Agent'],
-          Referer: `${BASE_URL}/index.php?page=homepage`,
-          Accept: '*/*'
-        },
-        timeout: 30000
-      });
+      const response = await client.get(
+        videoUrl,
+        withOptionalResidentialProxy({
+          method: 'GET',
+          responseType: 'stream',
+          headers: {
+            Range: req.headers.range,
+            'User-Agent': HEADERS['User-Agent'],
+            Referer: `${BASE_URL}/index.php?page=homepage`,
+            Accept: '*/*'
+          },
+          timeout: 30000
+        }, videoUrl)
+      );
 
       ['content-range', 'accept-ranges', 'content-length', 'content-type'].forEach(h => {
-        if (response.headers[h]) {
-          res.setHeader(h, response.headers[h]);
-        }
+        if (response.headers[h]) res.setHeader(h, response.headers[h]);
       });
 
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1498,12 +1445,9 @@ app.get('/api/stream-secure/:token/:sessionToken',
 
       res.status(response.status);
       response.data.pipe(res);
-
     } catch (error) {
       console.error('Erro no streaming:', error.message);
-      if (error.response) {
-        console.error('Status upstream:', error.response.status);
-      }
+      if (error.response) console.error('Status upstream:', error.response.status);
       res.sendStatus(403);
     }
   }
@@ -1511,16 +1455,15 @@ app.get('/api/stream-secure/:token/:sessionToken',
 
 app.post('/api/log-view', async (req, res) => {
   try {
-    const { userId, videoId, token, timestamp } = req.body;
+    const { userId, videoId } = req.body;
     console.log(`📊 Play: User ${userId} | Vídeo ${videoId}`);
     res.sendStatus(200);
-  } catch (error) {
+  } catch {
     res.sendStatus(500);
   }
 });
 
 // ===== API ADMINISTRATIVA =====
-
 function adminAuth(req, res, next) {
   const authToken = req.headers['authorization'];
   const validToken = process.env.ADMIN_API_TOKEN || 'seu-token-super-secreto';
@@ -1541,12 +1484,8 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         blocked: await User.countDocuments({ isBlocked: true })
       },
       purchases: {
-        total: (await User.aggregate([
-          { $group: { _id: null, total: { $sum: '$totalPurchases' } } }
-        ]))[0]?.total || 0,
-        revenue: (await User.aggregate([
-          { $group: { _id: null, total: { $sum: '$totalSpent' } } }
-        ]))[0]?.total || 0
+        total: (await User.aggregate([{ $group: { _id: null, total: { $sum: '$totalPurchases' } } }]))[0]?.total || 0,
+        revenue: (await User.aggregate([{ $group: { _id: null, total: { $sum: '$totalSpent' } } }]))[0]?.total || 0
       },
       content: {
         active: await PurchasedContent.countDocuments({ expiresAt: { $gt: new Date() } }),
@@ -1556,7 +1495,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         movies: CACHE_CONTEUDO.movies.length,
         series: CACHE_CONTEUDO.series.length
       },
-      network: 'IP local direto',
+      network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto',
       session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
 
@@ -1584,7 +1523,6 @@ app.post('/api/admin/refresh-cache', adminAuth, async (req, res) => {
 });
 
 // ===== WEBHOOK MERCADO PAGO =====
-
 app.post('/webhook/mercadopago', async (req, res) => {
   console.log('📥 Webhook do Mercado Pago recebido');
 
@@ -1604,12 +1542,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`
-        },
-        timeout: 10000
-      }
+      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` }, timeout: 10000 }
     );
 
     const payment = response.data;
@@ -1618,9 +1551,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
       const userId = parseInt(payment.external_reference);
       const amount = Math.round(payment.transaction_amount * 100);
 
-      if (!userId || !amount) {
-        return res.sendStatus(200);
-      }
+      if (!userId || !amount) return res.sendStatus(200);
 
       const sucesso = await telegramBot.processarPagamentoAprovado(paymentId, userId, amount);
 
@@ -1636,7 +1567,6 @@ app.post('/webhook/mercadopago', async (req, res) => {
 });
 
 // ===== LIMPEZA AUTOMÁTICA =====
-
 setInterval(async () => {
   try {
     const result = await RateLimit.deleteMany({
@@ -1654,10 +1584,7 @@ setInterval(async () => {
 
 setInterval(async () => {
   try {
-    const resultado = await PurchasedContent.deleteMany({
-      expiresAt: { $lt: new Date() }
-    });
-
+    const resultado = await PurchasedContent.deleteMany({ expiresAt: { $lt: new Date() } });
     if (resultado.deletedCount > 0) {
       console.log(`🧹 Removidos ${resultado.deletedCount} conteúdos expirados`);
     }
@@ -1667,16 +1594,15 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 // ===== INICIALIZAÇÃO =====
-
 async function iniciarServidor() {
   try {
-    // ===== SESSÃO VIA .ENV (prioritário — evita login via Cloudflare) =====
     if (SESSION_COOKIES_ENV) {
       console.log('🍪 SESSION_COOKIES encontrado no .env — hidratando CookieJar e pulando login...');
       await hydrateJarFromCookieString(SESSION_COOKIES_ENV, BASE_URL);
 
       if (CF_CLEARANCE) {
         await jar.setCookie(`cf_clearance=${CF_CLEARANCE}; Path=/`, BASE_URL);
+        await jar.setCookie(`cf_clearance=${CF_CLEARANCE}; Path=/`, BASE_URL.replace(/^http:\/\//i, 'https://'));
       }
 
       userSession.user = LOGIN_USER;
@@ -1688,14 +1614,13 @@ async function iniciarServidor() {
       console.log('✅ Sessão carregada do .env com sucesso!');
       await atualizarCache();
     } else if (LOGIN_USER && LOGIN_PASS) {
-      // Fallback: tentar login normal (só funciona em IP residencial)
       console.log('🔐 SESSION_COOKIES não definido — tentando login automático...');
       const loginSucesso = await fazerLoginVouver(LOGIN_USER, LOGIN_PASS);
 
       if (!loginSucesso) {
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('⚠️ MODO DEGRADADO ATIVADO');
-        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��');
+        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('Login falhou e SESSION_COOKIES não definido.');
         console.error('Solução: rode capturar-cookies.js localmente');
         console.error('e cole SESSION_COOKIES=... no .env do servidor.');
@@ -1707,26 +1632,21 @@ async function iniciarServidor() {
 
     telegramBot.initBot(
       { User, AssetSize, PurchasedContent },
-      {
-        buscarDetalhes,
-        estimarDuracao,
-        atualizarCache,
-        CACHE_CONTEUDO
-      },
+      { buscarDetalhes, estimarDuracao, atualizarCache, CACHE_CONTEUDO },
       DOMINIO_PUBLICO
     );
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - IP Local Edition!');
+      console.log('🚀 FastTV Server!');
       console.log('='.repeat(60));
       console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
       console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌐 Rede: IP local direto (sem proxy)`);
+      console.log(`🌐 Rede: ${residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto'}`);
       console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
       console.log(`🎬 Player: Video.js com proteção DRM`);
       console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
-      console.log(`📝 Encoding: UTF-8 corrigido (200+ padrões)`);
+      console.log(`📝 Encoding: UTF-8 corrigido`);
       console.log(`⏱️ Duração: Exata para filmes (HTML)`);
       console.log(`🤖 Bot: Ativo`);
       console.log(`💳 PIX: ${MP_ACCESS_TOKEN ? 'Ativo' : 'Inativo'}`);
@@ -1738,14 +1658,13 @@ async function iniciarServidor() {
       console.log('🔄 Atualização automática do cache (6h)...');
       await atualizarCache();
     }, 6 * 60 * 60 * 1000);
-
   } catch (error) {
     console.error('❌ Erro ao iniciar servidor:', error);
     process.exit(1);
   }
 }
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('❌ Unhandled Rejection:', reason);
 });
 
