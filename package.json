@@ -35,8 +35,6 @@
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
     "fs-extra": "^11.3.3",
-    "http-proxy-agent": "^9.0.0",
-    "https-proxy-agent": "^7.0.6",
     "iconv-lite": "^0.7.2",
     "jsonwebtoken": "^9.0.3",
     "moment": "^2.30.1",
