@@ -1301,37 +1301,6 @@ app.get('/api/refresh-stream/:token/:sessionToken',
 // O usuário nunca acessa esta rota diretamente; ela não aparece no browser.
 app.get('/relay-stream', async (req, res) => {
   try {
-    // 1) Valida o secret compartilhado com o Worker
-    const secret = req.query.relay_secret;
-    if (!secret || secret !== RELAY_SECRET) {
-      console.warn(`⚠️ /relay-stream: secret inválido | IP: ${req.ip}`);
-      return res.status(403).send('Forbidden');
-    }
-
-    // 2) Valida e sanitiza a URL de destino
-    const targetUrl = req.query.target;
-    if (!targetUrl) {
-      return res.status(400).send('Missing target');
-    }
-
-    // Aceita apenas URLs do goplay.icu para evitar SSRF
-    let parsedTarget;
-    try {
-      parsedTarget = new URL(targetUrl);
-    } catch {
-      return res.status(400).send('Invalid target URL');
-    }
-
-    const allowedHosts = ['goplay.icu'];
-    if (!allowedHosts.some(h => parsedTarget.hostname === h || parsedTarget.hostname.endsWith('.' + h))) {
-      console.warn(`⚠️ /relay-stream: host não permitido: ${parsedTarget.hostname}`);
-      return res.status(403).send('Host not allowed');
-    }
-
-    // 3) Monta headers para o goplay.icu
-// ===== RELAY STREAM (atualizado com cookies + headers completos) =====
-app.get('/relay-stream', async (req, res) => {
-  try {
     const secret = req.query.relay_secret;
     if (!secret || secret !== RELAY_SECRET) {
       console.warn(`⚠️ /relay-stream: secret inválido | IP: ${req.ip}`);
@@ -1342,42 +1311,32 @@ app.get('/relay-stream', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Missing target');
 
     let parsedTarget;
-    try {
-      parsedTarget = new URL(targetUrl);
-    } catch {
+    try { parsedTarget = new URL(targetUrl); } catch {
       return res.status(400).send('Invalid target URL');
     }
 
-    const allowedHosts = ['goplay.icu'];
-    if (!allowedHosts.some(h => parsedTarget.hostname === h || parsedTarget.hostname.endsWith('.' + h))) {
-      console.warn(`⚠️ /relay-stream: host não permitido: ${parsedTarget.hostname}`);
+    if (!parsedTarget.hostname.includes('goplay.icu')) {
+      console.warn(`⚠️ Host não permitido: ${parsedTarget.hostname}`);
       return res.status(403).send('Host not allowed');
     }
 
-    // === HEADERS MELHORADOS + COOKIES (isso resolve o 403) ===
+    // Headers simples (a mesma versão que funcionou no seu curl)
     const upstreamHeaders = {
-      'User-Agent': HEADERS['User-Agent'],
-      'Accept': '*/*',
+      'User-Agent':      HEADERS['User-Agent'],
+      'Accept':          '*/*',
       'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
       'Accept-Encoding': 'gzip, deflate, br',
-      'Referer': 'http://vouver.me/',
-      'Origin': 'http://vouver.me',
-      'Connection': 'keep-alive',
-      'Sec-Fetch-Site': 'cross-site',
-      'Sec-Fetch-Mode': 'no-cors',
-      'Sec-Fetch-Dest': 'video',
-      'Cache-Control': 'no-cache',
-      // ←←← ESSA LINHA É A QUE RESOLVE O 403
-      'Cookie': buildCookieHeader(),   // ← inclui cf_clearance + SESSION_COOKIES
+      'Referer':         'http://vouver.me/',
+      'Origin':          'http://vouver.me',
+      'Connection':      'keep-alive',
+      'Cache-Control':   'no-cache',
+      'Pragma':          'no-cache',
     };
 
-    // Repassa Range (seek no player)
     const rangeParam = req.query.range || req.headers['range'];
-    if (rangeParam) {
-      upstreamHeaders['Range'] = rangeParam;
-    }
+    if (rangeParam) upstreamHeaders['Range'] = rangeParam;
 
-    console.log(`📡 Relay → ${parsedTarget.hostname}${parsedTarget.pathname} | Proxy: ${residentialProxyAgent ? 'residencial' : 'direto'}`);
+    console.log(`📡 Relay → ${parsedTarget.pathname} | Proxy residencial: ${!!residentialProxyAgent}`);
 
     const upstream = await axios({
       method: 'get',
@@ -1393,62 +1352,18 @@ app.get('/relay-stream', async (req, res) => {
       validateStatus: s => s < 500,
     });
 
-    console.log(`✅ Relay upstream status: ${upstream.status} (com cookies)`);
+    console.log(`✅ Relay upstream status: ${upstream.status} | video: ${parsedTarget.pathname}`);
 
-    // repassa headers úteis
-    const headersToForward = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
-    headersToForward.forEach(h => {
-      if (upstream.headers[h]) res.set(h, upstream.headers[h]);
-    });
-
-    res.set('Cache-Control', 'no-store, private');
-    res.set('X-Content-Type-Options', 'nosniff');
-    res.status(upstream.status);
-
-    upstream.data.pipe(res);
-
-    upstream.data.on('error', (err) => {
-      console.error('❌ Relay pipe error:', err.message);
-      if (!res.headersSent) res.status(502).send('Stream error');
-    });
-
-    req.on('close', () => {
-      if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
-    });
-
-  } catch (error) {
-    console.error('❌ Erro no /relay-stream:', error.message);
-    if (!res.headersSent) res.status(502).send('Stream error');
-  }
-});
-
-    // Repassa Range se vier do Worker (para seek funcionar no player)
-    const rangeParam = req.query.range || req.headers['range'];
-    if (rangeParam) {
-      upstreamHeaders['Range'] = rangeParam;
+    // DEBUG IMPORTANTE: mostra o corpo quando dá 403
+    if (upstream.status === 403) {
+      let errorBody = '';
+      upstream.data.on('data', chunk => {
+        errorBody += chunk.toString('utf8');
+        if (errorBody.length > 1000) upstream.data.destroy();
+      });
+      upstream.data.on('end', () => console.error(`❌ 403 BODY DO GOPLAY:\n${errorBody}`));
     }
 
-    console.log(`📡 Relay → ${parsedTarget.hostname}${parsedTarget.pathname} | Proxy: ${residentialProxyAgent ? 'residencial' : 'direto'}`);
-
-    // 4) Faz o request usando a proxy residencial
-    const upstream = await axios({
-      method:       'get',
-      url:          targetUrl,
-      headers:      upstreamHeaders,
-      responseType: 'stream',
-      // Usa a proxy residencial se configurada — este é o ponto chave
-      ...(residentialProxyAgent ? {
-        httpAgent:  residentialProxyAgent,
-        httpsAgent: residentialProxyAgent,
-        proxy:      false
-      } : {}),
-      timeout: 30000,
-      validateStatus: s => s < 500,
-    });
-
-    console.log(`✅ Relay upstream status: ${upstream.status}`);
-
-    // 5) Repassa headers relevantes para o Worker/cliente
     const headersToForward = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
     headersToForward.forEach(h => {
       if (upstream.headers[h]) res.set(h, upstream.headers[h]);
@@ -1458,20 +1373,15 @@ app.get('/relay-stream', async (req, res) => {
     res.set('X-Content-Type-Options', 'nosniff');
     res.status(upstream.status);
 
-    // 6) Pipe do stream diretamente para o Worker
     upstream.data.pipe(res);
 
-    // Lida com erros durante o pipe
-    upstream.data.on('error', (err) => {
+    upstream.data.on('error', err => {
       console.error('❌ Relay pipe error:', err.message);
       if (!res.headersSent) res.status(502).send('Stream error');
     });
 
     req.on('close', () => {
-      // Cliente desconectou — destrói o stream upstream para não desperdiçar banda
-      if (upstream.data && typeof upstream.data.destroy === 'function') {
-        upstream.data.destroy();
-      }
+      if (upstream.data?.destroy) upstream.data.destroy();
     });
 
   } catch (error) {
