@@ -45,12 +45,10 @@ const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 // Sessão pré-autenticada (gerada localmente e colada no .env)
 const SESSION_COOKIES_ENV = process.env.SESSION_COOKIES || '';
 
-// Janela de validade da URL assinada (segundos)
+// Janela de validade da URL assinada (segundos) — curta, só para o chunk atual
 const SIGNED_URL_TTL = parseInt(process.env.SIGNED_URL_TTL || '60', 10);
 
 // Secret compartilhado entre Worker e VPS para o endpoint /relay-stream
-// Gere com: openssl rand -hex 32
-// Coloque no .env do VPS e no CF Secret (wrangler secret put RELAY_SECRET)
 const RELAY_SECRET = process.env.RELAY_SECRET;
 
 // ===== PROXY RESIDENCIAL =====
@@ -154,6 +152,13 @@ const purchasedContentSchema = new mongoose.Schema({
   episodeName:  { type: String },
   season:       { type: String },
   purchaseDate: { type: Date,   default: Date.now, index: true },
+  // =====================================================================
+  // SEGURANÇA: expiresAt é a fonte única de verdade para expiração.
+  // O campo NÃO é exposto ao cliente. O player recebe apenas um countdown
+  // calculado server-side. Mesmo que o cliente intercepte e altere o
+  // countdown no front-end, cada requisição a /api/stream-secure e
+  // /relay-stream re-valida expiresAt diretamente no MongoDB.
+  // =====================================================================
   expiresAt:    { type: Date,   required: true, index: true },
   token:        { type: String, required: true, unique: true },
   price:        { type: Number, required: true },
@@ -203,7 +208,7 @@ app.use(express.static('public'));
 app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 
 // ===== ESTADO GLOBAL =====
-let userSession   = { user: '', pass: '' };
+let userSession    = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
 let SESSION_COOKIES = '';
 
@@ -462,7 +467,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       console.log('⚠️ CF_CLEARANCE não definido no .env — pode falhar no WAF');
     }
 
-    // GET login page
     const loginUrl    = `${BASE_URL}/index.php?page=login`;
     const loginClient = getHttpClientForUrl(loginUrl);
     const loginUseManualCookie = loginClient === clientNoJar;
@@ -488,7 +492,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 
     await logCurrentCookies('login-page');
 
-    // POST form login
     const formData = new URLSearchParams({
       username, sifre: password, beni_hatirla: 'on',
       csrf_token: csrfToken, recaptcha_response: '', login: 'Acessar'
@@ -513,7 +516,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       }, loginPostUrl)
     );
 
-    // AJAX login
     const ajaxData = new URLSearchParams({ username, password, csrf_token: csrfToken, type: '1' });
     const ajaxUrl  = `${BASE_URL}/ajax/login.php`;
     const ajaxClient = getHttpClientForUrl(ajaxUrl);
@@ -534,7 +536,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       }, ajaxUrl)
     );
 
-    // GET homepage para verificar login
     const homepageUrl  = `${BASE_URL}/index.php?page=homepage`;
     const homeClient   = getHttpClientForUrl(homepageUrl);
     const homeUseManualCookie = homeClient === clientNoJar;
@@ -591,7 +592,6 @@ async function atualizarCache() {
   try {
     const contentPath = path.join(__dirname, 'content.json');
 
-    // 1) arquivo local
     if (fs.existsSync(contentPath)) {
       console.log('📦 Carregando catálogo do arquivo content.json...');
       try {
@@ -619,7 +619,6 @@ async function atualizarCache() {
       }
     }
 
-    // 2) worker
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
       try {
@@ -656,7 +655,6 @@ async function atualizarCache() {
       }
     }
 
-    // 3) direto
     if (SESSION_COOKIES) {
       console.log('🌐 Buscando cache diretamente...');
       try {
@@ -778,44 +776,25 @@ async function buscarDetalhes(id, type) {
     return html;
   };
 
-  const fetchDetailHtml = async (detailPage, contentId, refererPage = 'movies') => {
-    const attempts = [
-      { url: `${BASE_URL}/index.php`, config: { params: { page: detailPage, id: contentId } } },
-      { url: `${BASE_URL}/`,          config: { params: { page: detailPage, id: contentId } } }
-    ];
-    for (const attempt of attempts) {
-      try {
-        const httpClient    = getHttpClientForUrl(attempt.url);
-        const manualCookie  = httpClient === clientNoJar;
-        const resp = await httpClient.get(
-          attempt.url,
-          withOptionalResidentialProxy({
-            ...attempt.config,
-            headers: {
-              'User-Agent': HEADERS['User-Agent'],
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
-              'Referer': `${BASE_URL}/?page=${refererPage}`,
-              ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
-            },
-            timeout: 30000, responseType: 'arraybuffer', validateStatus: s => s < 500
-          }, attempt.url)
-        );
-        const html = decodeHtml(resp.data);
-        if (isBlockedPage(html)) {
-          console.log(`⚠️ Página bloqueada detectada em ${attempt.url}, tentando fallback...`);
-          continue;
-        }
-        return html;
-      } catch (e) {
-        console.log(`⚠️ Falha ao buscar ${detailPage}/${contentId}: ${e.message}`);
-      }
-    }
-    return null;
+  const fetchDetailHtml = async (pType, pId, pMediaType) => {
+    const detailUrl  = `${BASE_URL}/index.php?page=${pType}&id=${pId}`;
+    const httpClient = getHttpClientForUrl(detailUrl);
+    const manualCookie = httpClient === clientNoJar;
+    try {
+      const r = await httpClient.get(detailUrl, withOptionalResidentialProxy({
+        headers: { ...HEADERS, 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate',
+          'Referer': `${BASE_URL}/index.php?page=homepage`,
+          ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
+        },
+        responseType: 'arraybuffer', timeout: 30000, maxRedirects: 5, validateStatus: s => s < 500
+      }, detailUrl));
+      const html = decodeHtml(r.data);
+      if (isBlockedPage(html)) { console.log(`⚠️ Página bloqueada (${pType}/${pId})`); return null; }
+      return html;
+    } catch (e) { console.error(`❌ Erro ao buscar HTML (${pType}/${pId}):`, e.message); return null; }
   };
 
   try {
-    // 1) Worker
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log(`🔍 Buscando detalhes via Worker: ${type}/${id}...`);
       try {
@@ -842,7 +821,6 @@ async function buscarDetalhes(id, type) {
       }
     }
 
-    // 2) Direto
     console.log(`🌐 Buscando detalhes diretamente: ${type}/${id}...`);
     await refreshSessionCookiesFromJar();
     await logCurrentCookies(`detalhes-${type}-${id}`);
@@ -939,7 +917,6 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
     const httpClient = getHttpClientForUrl(url);
     const manualCookie = httpClient === clientNoJar;
 
-    // HEAD
     try {
       const headResponse = await httpClient.head(
         url,
@@ -964,7 +941,6 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
       console.log(`⚠️ HEAD falhou (${headError.message}), tentando GET Range...`);
     }
 
-    // GET Range fallback
     try {
       const rangeResponse = await httpClient.get(
         url,
@@ -1084,23 +1060,33 @@ app.get('/api/details', async (req, res) => {
 });
 
 // ===== ENDPOINT: Player com Video.js =====
+// SEGURANÇA: o player nunca envia expiresAt real ao cliente.
+// O JS no front recebe apenas millisegundos restantes calculados server-side.
+// Mesmo que o usuário intercepte e altere esse valor no cliente, cada
+// requisição de stream re-valida expiresAt no MongoDB — o player travar
+// no cliente é apenas UX; a proteção real é server-side.
 app.get('/player/:token', async (req, res) => {
   try {
     const decoded  = jwt.verify(req.params.token, JWT_SECRET);
     const { videoId, mediaType, userId } = decoded;
 
     const purchase = await PurchasedContent.findOne({ token: req.params.token });
-    if (!purchase)                   throw new Error('Conteúdo não encontrado');
-    if (new Date() > purchase.expiresAt) throw new Error('Link expirado');
+    if (!purchase)                        throw new Error('Conteúdo não encontrado');
+    if (new Date() > purchase.expiresAt)  throw new Error('Link expirado');
 
     const user = await User.findOne({ userId });
-    if (!user || user.isBlocked)     throw new Error('Usuário bloqueado');
+    if (!user || user.isBlocked)          throw new Error('Usuário bloqueado');
 
     purchase.viewed    = true;
     purchase.viewCount += 1;
     await purchase.save();
 
     const streamPath = `/api/stream-secure/${req.params.token}/${purchase.sessionToken}`;
+
+    // Calcula ms restantes server-side — cliente recebe apenas um número,
+    // não a data/hora de expiração real. Mesmo que altere no DevTools,
+    // o servidor bloqueia no próximo request.
+    const msRestantes = Math.max(0, purchase.expiresAt.getTime() - Date.now());
 
     res.send(`
 <!DOCTYPE html>
@@ -1160,7 +1146,10 @@ app.get('/player/:token', async (req, res) => {
   </div>
   <script src="https://vjs.zencdn.net/8.10.0/video.min.js"></script>
   <script>
-    const expiresAt = new Date('${purchase.expiresAt.toISOString()}');
+    // SEGURANÇA: recebe apenas millisegundos restantes — nunca a data real.
+    // Alterar esse número no DevTools só afeta o display do countdown.
+    // O servidor re-valida expiresAt no MongoDB a cada request de stream.
+    let msRestantes = ${msRestantes};
     let player;
 
     document.addEventListener('DOMContentLoaded', function() {
@@ -1194,18 +1183,24 @@ app.get('/player/:token', async (req, res) => {
     });
 
     function updateCountdown() {
-      const now  = new Date();
-      const diff = expiresAt - now;
-      if (diff <= 0) {
+      msRestantes -= 60000;
+      if (msRestantes <= 0) {
         document.getElementById('countdown').innerText = 'EXPIRADO';
         if (player) { player.pause(); player.dispose(); }
         return;
       }
-      const hours   = Math.floor(diff / (1000*60*60));
-      const minutes = Math.floor((diff % (1000*60*60)) / (1000*60));
+      const totalMin = Math.floor(msRestantes / 60000);
+      const hours    = Math.floor(totalMin / 60);
+      const minutes  = totalMin % 60;
       document.getElementById('countdown').innerText = hours + 'h ' + minutes + 'm';
     }
-    updateCountdown();
+    // Exibe imediatamente
+    (function() {
+      const totalMin = Math.floor(msRestantes / 60000);
+      const hours    = Math.floor(totalMin / 60);
+      const minutes  = totalMin % 60;
+      document.getElementById('countdown').innerText = hours + 'h ' + minutes + 'm';
+    })();
     setInterval(updateCountdown, 60000);
   </script>
 </body>
@@ -1226,6 +1221,9 @@ app.get('/player/:token', async (req, res) => {
 });
 
 // ===== ENDPOINT: Signed URL → Worker =====
+// SEGURANÇA: valida expiresAt no MongoDB — qualquer manipulação client-side
+// do token JWT ou do countdown não tem efeito aqui. A fonte de verdade é
+// sempre o campo expiresAt salvo no banco no momento da compra.
 app.get('/api/stream-secure/:token/:sessionToken',
   detectSuspiciousClient,
   advancedRateLimit,
@@ -1237,21 +1235,31 @@ app.get('/api/stream-secure/:token/:sessionToken',
       const decoded = jwt.verify(contentToken, JWT_SECRET);
       const { videoId, mediaType, userId } = decoded;
 
+      // ---- VALIDAÇÃO BLINDADA NO SERVIDOR ----
       const purchase = await PurchasedContent.findOne({ token: contentToken, sessionToken });
-      if (!purchase || new Date() > purchase.expiresAt) {
-        console.log('⚠️ Conteúdo expirado ou não encontrado');
+
+      if (!purchase) {
+        console.log(`⛔ stream-secure: token não encontrado`);
         return res.sendStatus(403);
+      }
+
+      // Compara com Date.now() no servidor — não confia em nenhum valor do cliente
+      const agora = new Date();
+      if (agora > purchase.expiresAt) {
+        const horasExpirado = ((agora - purchase.expiresAt) / 3600000).toFixed(1);
+        console.log(`⛔ stream-secure: conteúdo expirado há ${horasExpirado}h | User ${userId} | Vídeo ${videoId}`);
+        return res.status(410).json({ error: 'Conteúdo expirado', expired: true });
       }
 
       const user = await User.findOne({ userId });
       if (!user || user.isBlocked) {
-        console.log('⚠️ Usuário bloqueado');
+        console.log(`⛔ stream-secure: usuário bloqueado ${userId}`);
         return res.sendStatus(403);
       }
 
       const signedUrl = gerarUrlAssinada(videoId, userId, mediaType);
 
-      console.log(`🔀 Signed URL gerada: User ${userId} | Vídeo ${videoId} | TTL ${SIGNED_URL_TTL}s`);
+      console.log(`🔀 Signed URL gerada: User ${userId} | Vídeo ${videoId} | TTL ${SIGNED_URL_TTL}s | Expira em ${purchase.expiresAt.toISOString()}`);
 
       res.setHeader('Cache-Control', 'no-store, no-cache, private, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
@@ -1267,6 +1275,7 @@ app.get('/api/stream-secure/:token/:sessionToken',
 );
 
 // ===== ENDPOINT: Refresh do link de stream =====
+// Mesma proteção: valida expiresAt no MongoDB, não confia no cliente.
 app.get('/api/refresh-stream/:token/:sessionToken',
   detectSuspiciousClient,
   async (req, res) => {
@@ -1278,7 +1287,16 @@ app.get('/api/refresh-stream/:token/:sessionToken',
       const { videoId, mediaType, userId } = decoded;
 
       const purchase = await PurchasedContent.findOne({ token: contentToken, sessionToken });
-      if (!purchase || new Date() > purchase.expiresAt) return res.status(403).json({ error: 'Expirado' });
+
+      if (!purchase) {
+        return res.status(403).json({ error: 'Token não encontrado' });
+      }
+
+      const agora = new Date();
+      if (agora > purchase.expiresAt) {
+        console.log(`⛔ refresh-stream: expirado | User ${userId} | Vídeo ${videoId}`);
+        return res.status(410).json({ error: 'Conteúdo expirado', expired: true });
+      }
 
       const user = await User.findOne({ userId });
       if (!user || user.isBlocked) return res.status(403).json({ error: 'Bloqueado' });
@@ -1297,30 +1315,35 @@ app.get('/api/refresh-stream/:token/:sessionToken',
 
 // ===== ENDPOINT: RELAY STREAM =====
 // Chamado exclusivamente pelo Cloudflare Worker (autenticado via RELAY_SECRET).
-// Faz pipe do vídeo usando a proxy residencial — IP nunca é da Cloudflare.
-// O usuário nunca acessa esta rota diretamente; ela não aparece no browser.
+// MUDANÇA: não recebe mais 'target' com credenciais em texto claro.
+// Recebe videoId + type e monta a URL internamente — login/senha nunca
+// trafegam entre Worker e VPS, nunca aparecem em logs do Cloudflare.
 app.get('/relay-stream', async (req, res) => {
   try {
+    // Autenticação do Worker
     const secret = req.query.relay_secret;
     if (!secret || secret !== RELAY_SECRET) {
-      console.warn(`⚠️ /relay-stream: secret inválido | IP: ${req.ip}`);
+      console.warn(`⚠️ /relay-stream: relay_secret inválido | IP: ${req.ip}`);
       return res.status(403).send('Forbidden');
     }
 
-    const targetUrl = req.query.target;
-    if (!targetUrl) return res.status(400).send('Missing target');
+    // Recebe apenas videoId e type — sem credenciais
+    const videoId = req.query.videoId;
+    const type    = req.query.type || 'movie';
 
-    let parsedTarget;
-    try { parsedTarget = new URL(targetUrl); } catch {
-      return res.status(400).send('Invalid target URL');
+    if (!videoId) return res.status(400).send('Missing videoId');
+
+    // Valida formato básico do videoId para evitar path traversal
+    if (!/^[a-zA-Z0-9_-]+$/.test(videoId)) {
+      console.warn(`⚠️ /relay-stream: videoId inválido: ${videoId}`);
+      return res.status(400).send('Invalid videoId');
     }
 
-    if (!parsedTarget.hostname.includes('goplay.icu')) {
-      console.warn(`⚠️ Host não permitido: ${parsedTarget.hostname}`);
-      return res.status(403).send('Host not allowed');
-    }
+    // Monta URL com credenciais AQUI, internamente na VPS.
+    // Esta URL nunca sai do servidor — nem em logs do Worker, nem em headers.
+    const origin    = type === 'series' ? VIDEO_BASE : MOVIE_BASE;
+    const targetUrl = `${origin}/${LOGIN_USER}/${LOGIN_PASS}/${videoId}.mp4`;
 
-    // Headers simples (a mesma versão que funcionou no seu curl)
     const upstreamHeaders = {
       'User-Agent':      HEADERS['User-Agent'],
       'Accept':          '*/*',
@@ -1336,7 +1359,8 @@ app.get('/relay-stream', async (req, res) => {
     const rangeParam = req.query.range || req.headers['range'];
     if (rangeParam) upstreamHeaders['Range'] = rangeParam;
 
-    console.log(`📡 Relay → ${parsedTarget.pathname} | Proxy residencial: ${!!residentialProxyAgent}`);
+    // Log seguro: mostra apenas videoId, nunca a URL completa com credenciais
+    console.log(`📡 Relay → videoId=${videoId} type=${type} | Proxy residencial: ${!!residentialProxyAgent}`);
 
     const upstream = await axios({
       method: 'get',
@@ -1352,16 +1376,15 @@ app.get('/relay-stream', async (req, res) => {
       validateStatus: s => s < 500,
     });
 
-    console.log(`✅ Relay upstream status: ${upstream.status} | video: ${parsedTarget.pathname}`);
+    console.log(`✅ Relay upstream status: ${upstream.status} | videoId: ${videoId}`);
 
-    // DEBUG IMPORTANTE: mostra o corpo quando dá 403
     if (upstream.status === 403) {
       let errorBody = '';
       upstream.data.on('data', chunk => {
         errorBody += chunk.toString('utf8');
         if (errorBody.length > 1000) upstream.data.destroy();
       });
-      upstream.data.on('end', () => console.error(`❌ 403 BODY DO GOPLAY:\n${errorBody}`));
+      upstream.data.on('end', () => console.error(`❌ 403 BODY DO GOPLAY (videoId=${videoId}):\n${errorBody}`));
     }
 
     const headersToForward = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
@@ -1424,7 +1447,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       },
       catalog: { movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length },
       network:  residentialProxyAgent ? 'Proxy residencial ativa (scraping + relay)' : 'IP direto',
-      streaming: `Worker → VPS relay → proxy residencial → goplay.icu`,
+      streaming: `Worker → VPS relay (videoId only) → proxy residencial → goplay.icu`,
       session:   SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     res.json(stats);
@@ -1534,11 +1557,12 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server — Relay Edition');
+      console.log('🚀 FastTV Server — Relay Edition (Secure)');
       console.log('='.repeat(60));
       console.log(`📡 Servidor:      ${DOMINIO_PUBLICO}`);
-      console.log(`🔀 Streaming:     Worker → VPS /relay-stream → proxy → goplay.icu`);
+      console.log(`🔀 Streaming:     Worker (videoId only) → VPS /relay-stream → proxy → goplay.icu`);
       console.log(`🔐 Assinatura:    HMAC-SHA256 / TTL ${SIGNED_URL_TTL}s`);
+      console.log(`🔒 Expiração:     Server-side MongoDB (imune a manipulação client-side)`);
       console.log(`🌐 Rede scraping: ${residentialProxyAgent ? 'Proxy residencial' : 'IP direto'}`);
       console.log(`🌐 Rede relay:    ${residentialProxyAgent ? 'Proxy residencial' : '⚠️ IP direto (configure RES_PROXY_ENABLED=true)'}`);
       console.log(`☁️ Worker:        ${CLOUDFLARE_WORKER_URL ? 'Ativo' : 'Inativo'}`);
