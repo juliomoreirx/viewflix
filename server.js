@@ -18,10 +18,11 @@ const { HttpProxyAgent } = require('http-proxy-agent');
 const telegramBot = require('./telegram-bot');
 
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
-const DOMINIO_PUBLICO = process.env.DOMINIO_PUBLICO || 'http://localhost:3000';
-const JWT_SECRET = process.env.JWT_SECRET;
-const PORT = process.env.PORT || 3000;
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const DOMINIO_PUBLICO    = process.env.DOMINIO_PUBLICO    || 'http://localhost:3000';
+const JWT_SECRET         = process.env.JWT_SECRET;
+const SIGNED_URL_SECRET  = process.env.SIGNED_URL_SECRET; // novo: openssl rand -hex 32
+const PORT               = process.env.PORT               || 3000;
+const MP_ACCESS_TOKEN    = process.env.MP_ACCESS_TOKEN;
 
 // MongoDB
 const MONGO_URI = process.env.MONGO_URI;
@@ -31,7 +32,7 @@ const LOGIN_USER = process.env.LOGIN_USER;
 const LOGIN_PASS = process.env.LOGIN_PASS;
 
 // URLs Base
-const BASE_URL = process.env.BASE_URL || 'http://vouver.me';
+const BASE_URL   = process.env.BASE_URL   || 'http://vouver.me';
 const VIDEO_BASE = process.env.VIDEO_BASE || 'http://goplay.icu/series';
 const MOVIE_BASE = process.env.MOVIE_BASE || 'http://goplay.icu/movie';
 
@@ -44,11 +45,13 @@ const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 // Sessão pré-autenticada (gerada localmente e colada no .env)
 const SESSION_COOKIES_ENV = process.env.SESSION_COOKIES || '';
 
+// Janela de validade da URL assinada (segundos)
+// Aumente para 120 em redes lentas; 30 é seguro para a maioria
+const SIGNED_URL_TTL = parseInt(process.env.SIGNED_URL_TTL || '60', 10);
+
 // ===== PROXY RESIDENCIAL =====
 const RES_PROXY_ENABLED = String(process.env.RES_PROXY_ENABLED || 'false')
-  .replace(/['"]/g, '')
-  .trim()
-  .toLowerCase() === 'true';
+  .replace(/['"]/g, '').trim().toLowerCase() === 'true';
 
 const RES_PROXY_HOST = (process.env.RES_PROXY_HOST || '').trim();
 const RES_PROXY_PORT = parseInt(String(process.env.RES_PROXY_PORT || '0').trim(), 10);
@@ -69,12 +72,7 @@ if (CLOUDFLARE_WORKER_URL) {
 }
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
-const requiredVars = {
-  MONGO_URI,
-  LOGIN_USER,
-  LOGIN_PASS,
-  JWT_SECRET
-};
+const requiredVars = { MONGO_URI, LOGIN_USER, LOGIN_PASS, JWT_SECRET, SIGNED_URL_SECRET };
 
 for (const [key, value] of Object.entries(requiredVars)) {
   if (!value) {
@@ -95,6 +93,7 @@ console.log(`👤 Usuário Vouver: ${LOGIN_USER}`);
 console.log(`📡 Base URL: ${BASE_URL}`);
 console.log(`🎬 Movie Base: ${MOVIE_BASE}`);
 console.log(`📺 Video Base: ${VIDEO_BASE}`);
+console.log(`🔐 Signed URL TTL: ${SIGNED_URL_TTL}s`);
 
 // ===== CONEXÃO MONGODB =====
 mongoose.connect(MONGO_URI)
@@ -106,20 +105,20 @@ mongoose.connect(MONGO_URI)
 
 // ===== MODELS =====
 const userSchema = new mongoose.Schema({
-  userId: { type: Number, required: true, unique: true, index: true },
-  firstName: { type: String, required: true },
-  lastName: { type: String },
-  username: { type: String },
-  phoneNumber: { type: String },
-  credits: { type: Number, default: 0 },
-  isActive: { type: Boolean, default: true },
-  isBlocked: { type: Boolean, default: false },
+  userId:        { type: Number,  required: true, unique: true, index: true },
+  firstName:     { type: String,  required: true },
+  lastName:      { type: String },
+  username:      { type: String },
+  phoneNumber:   { type: String },
+  credits:       { type: Number,  default: 0 },
+  isActive:      { type: Boolean, default: true },
+  isBlocked:     { type: Boolean, default: false },
   blockedReason: { type: String },
-  registeredAt: { type: Date, default: Date.now },
-  lastAccess: { type: Date, default: Date.now },
-  totalSpent: { type: Number, default: 0 },
-  totalPurchases: { type: Number, default: 0 },
-  language: { type: String, default: 'pt-BR' },
+  registeredAt:  { type: Date,    default: Date.now },
+  lastAccess:    { type: Date,    default: Date.now },
+  totalSpent:    { type: Number,  default: 0 },
+  totalPurchases:{ type: Number,  default: 0 },
+  language:      { type: String,  default: 'pt-BR' },
   notificationsEnabled: { type: Boolean, default: true },
   metadata: {
     telegramLanguageCode: String,
@@ -131,47 +130,43 @@ const userSchema = new mongoose.Schema({
 userSchema.index({ username: 1 });
 userSchema.index({ isActive: 1, isBlocked: 1 });
 userSchema.index({ registeredAt: -1 });
-
 const User = mongoose.model('User', userSchema);
 
 const assetSizeSchema = new mongoose.Schema({
-  assetId: { type: String, required: true, unique: true, index: true },
+  assetId:   { type: String, required: true, unique: true, index: true },
   mediaType: { type: String, enum: ['movie', 'series', 'series_ep'], required: true },
-  bytes: { type: Number, default: 0 },
-  updatedAt: { type: Date, default: Date.now, index: true }
+  bytes:     { type: Number, default: 0 },
+  updatedAt: { type: Date,   default: Date.now, index: true }
 });
-
 assetSizeSchema.index({ assetId: 1, mediaType: 1 });
 const AssetSize = mongoose.model('AssetSize', assetSizeSchema);
 
 const purchasedContentSchema = new mongoose.Schema({
-  userId: { type: Number, required: true, index: true },
-  videoId: { type: String, required: true },
-  mediaType: { type: String, enum: ['movie', 'series'], required: true },
-  title: { type: String, required: true },
-  episodeName: { type: String },
-  season: { type: String },
-  purchaseDate: { type: Date, default: Date.now, index: true },
-  expiresAt: { type: Date, required: true, index: true },
-  token: { type: String, required: true, unique: true },
-  price: { type: Number, required: true },
-  viewed: { type: Boolean, default: false },
-  viewCount: { type: Number, default: 0 },
+  userId:       { type: Number, required: true, index: true },
+  videoId:      { type: String, required: true },
+  mediaType:    { type: String, enum: ['movie', 'series'], required: true },
+  title:        { type: String, required: true },
+  episodeName:  { type: String },
+  season:       { type: String },
+  purchaseDate: { type: Date,   default: Date.now, index: true },
+  expiresAt:    { type: Date,   required: true, index: true },
+  token:        { type: String, required: true, unique: true },
+  price:        { type: Number, required: true },
+  viewed:       { type: Boolean, default: false },
+  viewCount:    { type: Number,  default: 0 },
   notificationSent: { type: Boolean, default: false },
   sessionToken: { type: String, unique: true }
 });
-
 purchasedContentSchema.index({ userId: 1, expiresAt: 1 });
 purchasedContentSchema.index({ expiresAt: 1, notificationSent: 1 });
 const PurchasedContent = mongoose.model('PurchasedContent', purchasedContentSchema);
 
 const rateLimitSchema = new mongoose.Schema({
   identifier: { type: String, required: true, unique: true, index: true },
-  requests: [{ timestamp: Date, videoId: String }],
-  blocked: { type: Boolean, default: false },
+  requests:   [{ timestamp: Date, videoId: String }],
+  blocked:    { type: Boolean, default: false },
   blockedUntil: { type: Date }
 });
-
 const RateLimit = mongoose.model('RateLimit', rateLimitSchema);
 
 // ===== EXPRESS + AXIOS =====
@@ -185,17 +180,17 @@ const client = wrapper(axios.create({ jar, withCredentials: true }));
 const clientNoJar = axios.create({ withCredentials: false });
 
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-  "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Connection": "keep-alive",
+  "User-Agent":        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+  "Accept-Language":   "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Encoding":   "gzip, deflate, br",
+  "Connection":        "keep-alive",
   "Upgrade-Insecure-Requests": "1",
-  "Cache-Control": "max-age=0",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1"
+  "Cache-Control":     "max-age=0",
+  "Sec-Fetch-Dest":    "document",
+  "Sec-Fetch-Mode":    "navigate",
+  "Sec-Fetch-Site":    "none",
+  "Sec-Fetch-User":    "?1"
 };
 
 app.use(express.json());
@@ -203,20 +198,18 @@ app.use(express.static('public'));
 app.use('/covers', express.static(path.join(__dirname, 'public', 'covers')));
 
 // ===== ESTADO GLOBAL =====
-let userSession = { user: '', pass: '' };
+let userSession   = { user: '', pass: '' };
 let CACHE_CONTEUDO = { movies: [], series: [], lastUpdated: 0 };
 let SESSION_COOKIES = '';
 
 // ===== HELPERS PROXY/HTTP =====
 function shouldUseResidentialProxy(url) {
   try {
-    const u = new URL(url);
+    const u    = new URL(url);
     const host = u.hostname.toLowerCase();
     return (
-      host === 'vouver.me' ||
-      host.endsWith('.vouver.me') ||
-      host === 'goplay.icu' ||
-      host.endsWith('.goplay.icu')
+      host === 'vouver.me'     || host.endsWith('.vouver.me') ||
+      host === 'goplay.icu'    || host.endsWith('.goplay.icu')
     );
   } catch {
     return false;
@@ -225,19 +218,14 @@ function shouldUseResidentialProxy(url) {
 
 function withOptionalResidentialProxy(axiosConfig = {}, url = '') {
   if (residentialProxyAgent && shouldUseResidentialProxy(url)) {
-    return {
-      ...axiosConfig,
-      httpAgent: residentialProxyAgent,
-      httpsAgent: residentialProxyAgent,
-      proxy: false
-    };
+    return { ...axiosConfig, httpAgent: residentialProxyAgent, httpsAgent: residentialProxyAgent, proxy: false };
   }
   return axiosConfig;
 }
 
 function getHttpClientForUrl(url) {
   if (residentialProxyAgent && shouldUseResidentialProxy(url)) {
-    return clientNoJar; // evita erro axios-cookiejar-support + Agent
+    return clientNoJar; // evita conflito axios-cookiejar-support + Agent
   }
   return client;
 }
@@ -254,11 +242,10 @@ function buildCookieHeader() {
 async function hydrateJarFromCookieString(cookieStr, baseUrl) {
   if (!cookieStr) return;
   const parts = cookieStr.split(';').map(s => s.trim()).filter(Boolean);
-
   for (const part of parts) {
     const idx = part.indexOf('=');
     if (idx <= 0) continue;
-    const name = part.substring(0, idx).trim();
+    const name  = part.substring(0, idx).trim();
     const value = part.substring(idx + 1).trim();
     try {
       await jar.setCookie(`${name}=${value}; Path=/`, baseUrl);
@@ -271,7 +258,7 @@ async function hydrateJarFromCookieString(cookieStr, baseUrl) {
 
 async function refreshSessionCookiesFromJar() {
   try {
-    const cookiesHttp = await jar.getCookies(BASE_URL);
+    const cookiesHttp  = await jar.getCookies(BASE_URL);
     const cookiesHttps = await jar.getCookies(BASE_URL.replace(/^http:\/\//i, 'https://'));
     const merged = new Map();
     [...cookiesHttp, ...cookiesHttps].forEach(c => merged.set(c.key, c.value));
@@ -299,13 +286,11 @@ function generateStreamToken() {
 
 function encryptData(data, secret) {
   try {
-    const iv = crypto.randomBytes(16);
+    const iv  = crypto.randomBytes(16);
     const key = crypto.createHash('sha256').update(secret).digest();
     const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-
     let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'hex');
     encrypted += cipher.final('hex');
-
     return iv.toString('hex') + ':' + encrypted;
   } catch (error) {
     console.error('Erro ao encriptar dados:', error);
@@ -317,19 +302,65 @@ function decryptData(encrypted, secret) {
   try {
     const parts = encrypted.split(':');
     if (parts.length !== 2) return null;
-
-    const iv = Buffer.from(parts[0], 'hex');
+    const iv            = Buffer.from(parts[0], 'hex');
     const encryptedData = parts[1];
-    const key = crypto.createHash('sha256').update(secret).digest();
-    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-
+    const key           = crypto.createHash('sha256').update(secret).digest();
+    const decipher      = crypto.createDecipheriv('aes-256-cbc', key, iv);
     let decrypted = decipher.update(encryptedData, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
-
     return JSON.parse(decrypted);
   } catch (error) {
     console.error('Erro ao decriptar dados:', error);
     return null;
+  }
+}
+
+// ===== GERAR / VALIDAR URL ASSINADA =====
+/**
+ * Gera uma URL assinada com HMAC-SHA256 que expira em SIGNED_URL_TTL segundos.
+ *
+ * O path exposto ao cliente é SEMPRE /stream/<videoId>.mp4 — sem user/pass.
+ * O Worker (CF) reconstrói internamente a URL real do goplay.icu usando os
+ * CF Secrets (LOGIN_USER / LOGIN_PASS), que jamais aparecem na URL pública.
+ *
+ * Payload da assinatura: "/stream/<videoId>.mp4:<exp>:<userId>"
+ * URL final:  https://stream.seudominio.com/stream/<videoId>.mp4?sig=...&exp=...&uid=...&type=movie|series
+ */
+function gerarUrlAssinada(videoId, userId, mediaType) {
+  // Path opaco — não contém user nem pass
+  const videoPath = `/stream/${videoId}.mp4`;
+  const exp       = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL;
+
+  const sigPayload = `${videoPath}:${exp}:${userId}`;
+  const sig = crypto
+    .createHmac('sha256', SIGNED_URL_SECRET)
+    .update(sigPayload)
+    .digest('hex');
+
+  // CLOUDFLARE_WORKER_URL deve apontar para stream.seudominio.com
+  const base = CLOUDFLARE_WORKER_URL || 'https://stream.seudominio.com';
+  return `${base}${videoPath}?sig=${sig}&exp=${exp}&uid=${userId}&type=${mediaType}`;
+}
+
+/**
+ * Valida uma URL assinada recebida (útil para endpoints de verificação).
+ * Retorna true se a assinatura for válida e não expirada.
+ */
+function validarUrlAssinada(videoId, sig, exp, userId) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    if (now > parseInt(exp, 10) + 5) return false;
+
+    const videoPath  = `/stream/${videoId}.mp4`;
+    const sigPayload = `${videoPath}:${exp}:${userId}`;
+    const expected   = crypto
+      .createHmac('sha256', SIGNED_URL_SECRET)
+      .update(sigPayload)
+      .digest('hex');
+
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig));
+  } catch {
+    return false;
   }
 }
 
@@ -354,15 +385,11 @@ async function advancedRateLimit(req, res, next) {
     limiter.requests.push({ timestamp: now, videoId: req.params.token });
 
     if (limiter.requests.length > 100) {
-      limiter.blocked = true;
+      limiter.blocked      = true;
       limiter.blockedUntil = new Date(now.getTime() + 15 * 60 * 1000);
       await limiter.save();
-
       console.log(`🚫 IP bloqueado por excesso de requisições: ${identifier}`);
-      return res.status(429).json({
-        error: 'Rate limit exceeded. Blocked for 15 minutes.',
-        retryAfter: 900
-      });
+      return res.status(429).json({ error: 'Rate limit exceeded. Blocked for 15 minutes.', retryAfter: 900 });
     }
 
     await limiter.save();
@@ -376,38 +403,29 @@ async function advancedRateLimit(req, res, next) {
 // ===== MIDDLEWARE: Fingerprinting =====
 function detectSuspiciousClient(req, res, next) {
   const userAgent = req.headers['user-agent'] || '';
-
   const suspiciousAgents = [
     'wget', 'curl', 'python-requests', 'java', 'go-http-client',
     'download', 'bot', 'spider', 'crawler', 'scraper', 'axios',
     'node-fetch', 'okhttp', 'apache-httpclient', 'downloader'
   ];
-
-  const isSuspicious = suspiciousAgents.some(agent =>
-    userAgent.toLowerCase().includes(agent)
-  );
-
+  const isSuspicious = suspiciousAgents.some(a => userAgent.toLowerCase().includes(a));
   if (isSuspicious) {
     console.log(`⚠️ Cliente suspeito detectado: ${userAgent} | IP: ${req.ip}`);
     return res.status(403).json({ error: 'Access denied' });
   }
-
   next();
 }
 
 // ===== MIDDLEWARE: CORS Restritivo =====
 function strictCORS(req, res, next) {
-  const origin = req.headers.origin;
+  const origin         = req.headers.origin;
   const allowedOrigins = [DOMINIO_PUBLICO];
-
   if (allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
-
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Stream-Token, X-Encrypted-Data');
   res.setHeader('Access-Control-Max-Age', '600');
-
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 }
@@ -417,9 +435,9 @@ function extrairCookies(setCookieHeader, cookiesArray = []) {
   const cookies = [...cookiesArray];
   (setCookieHeader || []).forEach(cookieStr => {
     const pair = cookieStr.split(';')[0];
-    const idx = pair.indexOf('=');
+    const idx  = pair.indexOf('=');
     if (idx > 0) {
-      const name = pair.substring(0, idx).trim();
+      const name  = pair.substring(0, idx).trim();
       const value = pair.substring(idx + 1).trim();
       const existing = cookies.findIndex(c => c.name === name);
       if (existing >= 0) cookies[existing].value = value;
@@ -436,7 +454,6 @@ function cookieString(arr) {
 // ===== FUNÇÃO DE LOGIN =====
 async function fazerLoginVouver(username, password, tentativa = 1) {
   const MAX_TENTATIVAS = 3;
-
   if (tentativa > MAX_TENTATIVAS) {
     console.error(`❌ Falha após ${MAX_TENTATIVAS} tentativas`);
     return false;
@@ -457,7 +474,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
     }
 
     // GET login page
-    const loginUrl = `${BASE_URL}/index.php?page=login`;
+    const loginUrl    = `${BASE_URL}/index.php?page=login`;
     const loginClient = getHttpClientForUrl(loginUrl);
     const loginUseManualCookie = loginClient === clientNoJar;
 
@@ -469,13 +486,11 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
           'Sec-Fetch-Site': 'none',
           ...(loginUseManualCookie ? { Cookie: buildCookieHeader() } : {})
         },
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: s => s < 500
+        timeout: 30000, maxRedirects: 5, validateStatus: s => s < 500
       }, loginUrl)
     );
 
-    const htmlPage = loginPageResponse.data || '';
+    const htmlPage  = loginPageResponse.data || '';
     const csrfMatch =
       String(htmlPage).match(/name=["']csrf_token["']\s+value=["']([\w-]+)["']/i) ||
       String(htmlPage).match(/csrf_token["']\s+value=["']([a-f0-9-]+)["']/i) ||
@@ -486,76 +501,53 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 
     // POST form login
     const formData = new URLSearchParams({
-      username,
-      sifre: password,
-      beni_hatirla: 'on',
-      csrf_token: csrfToken,
-      recaptcha_response: '',
-      login: 'Acessar'
+      username, sifre: password, beni_hatirla: 'on',
+      csrf_token: csrfToken, recaptcha_response: '', login: 'Acessar'
     });
 
-    const loginPostUrl = `${BASE_URL}/index.php?page=login`;
-    const postClient = getHttpClientForUrl(loginPostUrl);
+    const loginPostUrl  = `${BASE_URL}/index.php?page=login`;
+    const postClient    = getHttpClientForUrl(loginPostUrl);
     const postUseManualCookie = postClient === clientNoJar;
 
     await postClient.post(
-      loginPostUrl,
-      formData.toString(),
+      loginPostUrl, formData.toString(),
       withOptionalResidentialProxy({
         headers: {
           ...HEADERS,
           'Content-Type': 'application/x-www-form-urlencoded',
-          Origin: BASE_URL,
-          Referer: `${BASE_URL}/index.php?page=login`,
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-User': '?1',
-          'Sec-Fetch-Dest': 'document',
-          'Upgrade-Insecure-Requests': '1',
+          Origin: BASE_URL, Referer: `${BASE_URL}/index.php?page=login`,
+          'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-User': '?1', 'Sec-Fetch-Dest': 'document', 'Upgrade-Insecure-Requests': '1',
           ...(postUseManualCookie ? { Cookie: buildCookieHeader() } : {})
         },
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: s => s < 500
+        timeout: 30000, maxRedirects: 5, validateStatus: s => s < 500
       }, loginPostUrl)
     );
 
     // AJAX login
-    const ajaxData = new URLSearchParams({
-      username,
-      password,
-      csrf_token: csrfToken,
-      type: '1'
-    });
-
-    const ajaxUrl = `${BASE_URL}/ajax/login.php`;
+    const ajaxData = new URLSearchParams({ username, password, csrf_token: csrfToken, type: '1' });
+    const ajaxUrl  = `${BASE_URL}/ajax/login.php`;
     const ajaxClient = getHttpClientForUrl(ajaxUrl);
     const ajaxUseManualCookie = ajaxClient === clientNoJar;
 
     await ajaxClient.post(
-      ajaxUrl,
-      ajaxData.toString(),
+      ajaxUrl, ajaxData.toString(),
       withOptionalResidentialProxy({
         headers: {
           ...HEADERS,
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
           'X-Requested-With': 'XMLHttpRequest',
-          Origin: BASE_URL,
-          Referer: `${BASE_URL}/index.php?page=login`,
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Dest': 'empty',
+          Origin: BASE_URL, Referer: `${BASE_URL}/index.php?page=login`,
+          'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty',
           ...(ajaxUseManualCookie ? { Cookie: buildCookieHeader() } : {})
         },
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: s => s < 500
+        timeout: 30000, maxRedirects: 5, validateStatus: s => s < 500
       }, ajaxUrl)
     );
 
-    // GET homepage to verify
-    const homepageUrl = `${BASE_URL}/index.php?page=homepage`;
-    const homeClient = getHttpClientForUrl(homepageUrl);
+    // GET homepage para verificar login
+    const homepageUrl  = `${BASE_URL}/index.php?page=homepage`;
+    const homeClient   = getHttpClientForUrl(homepageUrl);
     const homeUseManualCookie = homeClient === clientNoJar;
 
     const homepageResponse = await homeClient.get(
@@ -564,13 +556,10 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         headers: {
           ...HEADERS,
           Referer: `${BASE_URL}/index.php?page=login`,
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'navigate',
-          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'navigate', 'Upgrade-Insecure-Requests': '1',
           ...(homeUseManualCookie ? { Cookie: buildCookieHeader() } : {})
         },
-        timeout: 30000,
-        maxRedirects: 5
+        timeout: 30000, maxRedirects: 5
       }, homepageUrl)
     );
 
@@ -579,12 +568,9 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       console.log('✅✅✅ LOGIN VERIFICADO COM SUCESSO!');
       userSession.user = username;
       userSession.pass = password;
-
       await refreshSessionCookiesFromJar();
       await logCurrentCookies('login-sucesso');
-
       console.log(`🍪 SESSION_COOKIES atualizado (${SESSION_COOKIES.length} chars)`);
-
       await atualizarCache();
       return true;
     }
@@ -601,7 +587,6 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
         : JSON.stringify(error.response.data).slice(0, 300);
       console.error(`   Body: ${body}`);
     }
-
     if (tentativa < MAX_TENTATIVAS) {
       console.log('🔄 Tentando novamente...');
       return await fazerLoginVouver(username, password, tentativa + 1);
@@ -620,11 +605,9 @@ async function atualizarCache() {
     // 1) arquivo local
     if (fs.existsSync(contentPath)) {
       console.log('📦 Carregando catálogo do arquivo content.json...');
-
       try {
         const fileContent = fs.readFileSync(contentPath, 'utf8');
-        const cacheData = JSON.parse(fileContent);
-
+        const cacheData   = JSON.parse(fileContent);
         let rawMovies = [], rawSeries = [];
 
         if (cacheData.data) {
@@ -636,10 +619,9 @@ async function atualizarCache() {
         }
 
         if (rawMovies.length > 0 || rawSeries.length > 0) {
-          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.movies      = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.series      = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
-
           console.log(`✅ Cache carregado do arquivo JSON: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
           return;
         }
@@ -651,46 +633,32 @@ async function atualizarCache() {
     // 2) worker
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
-
       try {
         const response = await axios.post(
           `${CLOUDFLARE_WORKER_URL}/cache-direct`,
           { cookies: SESSION_COOKIES },
           { timeout: 30000 }
         );
-
         const data = response.data;
         if (data.success && data.data) {
           let rawMovies = [], rawSeries = [];
-
-          if (data.data.data) {
-            rawMovies = data.data.data.movies || [];
-            rawSeries = data.data.data.series || [];
-          } else if (data.data.movies) {
-            rawMovies = data.data.movies;
-            rawSeries = data.data.series;
-          }
+          if (data.data.data) { rawMovies = data.data.data.movies || []; rawSeries = data.data.data.series || []; }
+          else if (data.data.movies) { rawMovies = data.data.movies; rawSeries = data.data.series; }
 
           if (rawMovies.length > 0 || rawSeries.length > 0) {
-            CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-            CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+            CACHE_CONTEUDO.movies      = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+            CACHE_CONTEUDO.series      = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
             CACHE_CONTEUDO.lastUpdated = Date.now();
-
             console.log(`✅ Cache obtido via Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
 
             try {
-              const dataToSave = {
-                status: true,
-                error: null,
+              fs.writeFileSync(contentPath, JSON.stringify({
+                status: true, error: null,
                 data: { movies: rawMovies, series: rawSeries },
                 lastUpdated: new Date().toISOString()
-              };
-              fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
+              }, null, 2), 'utf8');
               console.log('💾 Cache salvo em content.json');
-            } catch {
-              console.log('⚠️ Não foi possível salvar content.json');
-            }
-
+            } catch { console.log('⚠️ Não foi possível salvar content.json'); }
             return;
           }
         }
@@ -702,11 +670,9 @@ async function atualizarCache() {
     // 3) direto
     if (SESSION_COOKIES) {
       console.log('🌐 Buscando cache diretamente...');
-
       try {
         await refreshSessionCookiesFromJar();
-
-        const searchUrl = `${BASE_URL}/app/_search.php?q=a`;
+        const searchUrl  = `${BASE_URL}/app/_search.php?q=a`;
         const httpClient = getHttpClientForUrl(searchUrl);
         const manualCookie = httpClient === clientNoJar;
 
@@ -719,42 +685,29 @@ async function atualizarCache() {
               'Referer': `${BASE_URL}/index.php?page=homepage`,
               ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
             },
-            timeout: 30000,
-            validateStatus: s => s < 500
+            timeout: 30000, validateStatus: s => s < 500
           }, searchUrl)
         );
 
         const cacheData = cacheResponse.data;
-
         let rawMovies = [], rawSeries = [];
-        if (cacheData.data) {
-          rawMovies = cacheData.data.movies || [];
-          rawSeries = cacheData.data.series || [];
-        } else if (cacheData.movies) {
-          rawMovies = cacheData.movies;
-          rawSeries = cacheData.series;
-        }
+        if (cacheData.data) { rawMovies = cacheData.data.movies || []; rawSeries = cacheData.data.series || []; }
+        else if (cacheData.movies) { rawMovies = cacheData.movies; rawSeries = cacheData.series; }
 
         if (rawMovies.length > 0 || rawSeries.length > 0) {
-          CACHE_CONTEUDO.movies = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
-          CACHE_CONTEUDO.series = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.movies      = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
+          CACHE_CONTEUDO.series      = rawSeries.sort((a, b) => a.name.localeCompare(b.name));
           CACHE_CONTEUDO.lastUpdated = Date.now();
-
           console.log(`✅ Cache obtido diretamente: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
 
           try {
-            const dataToSave = {
-              status: true,
-              error: null,
+            fs.writeFileSync(contentPath, JSON.stringify({
+              status: true, error: null,
               data: { movies: rawMovies, series: rawSeries },
               lastUpdated: new Date().toISOString()
-            };
-            fs.writeFileSync(contentPath, JSON.stringify(dataToSave, null, 2), 'utf8');
+            }, null, 2), 'utf8');
             console.log('💾 Cache salvo em content.json');
-          } catch {
-            console.log('⚠️ Não foi possível salvar content.json');
-          }
-
+          } catch { console.log('⚠️ Não foi possível salvar content.json'); }
           return;
         }
       } catch (directError) {
@@ -784,39 +737,27 @@ function corrigirCaracteresEspeciais(html) {
     '&Otilde;': 'Õ', '&Iacute;': 'Í', '&Oacute;': 'Ó', '&Uacute;': 'Ú',
     '&Acirc;': 'Â', '&Ecirc;': 'Ê', '&Ocirc;': 'Ô', '&Agrave;': 'À'
   };
-
   for (const [entity, char] of Object.entries(entitiesMap)) {
     html = html.split(entity).join(char);
   }
-
   return html;
 }
 
 // ===== FUNÇÃO: LIMPAR TEXTO =====
 function limparTexto(texto) {
   if (!texto) return '';
-
   texto = texto.trim().replace(/\s+/g, ' ');
-
   texto = texto
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   const correcoes = {
     'Ã§': 'ç', 'Ã©': 'é', 'Ã¡': 'á', 'Ã£': 'ã', 'Ãµ': 'õ', 'Ã­': 'í',
     'Ã³': 'ó', 'Ãº': 'ú', 'Ã¢': 'â', 'Ãª': 'ê', 'Ã´': 'ô', 'Ã ': 'à',
-    'a??o': 'ação', 'A??o': 'Ação',
-    'fic??o': 'ficção', 'miss?o': 'missão', 'cora??o': 'coração'
+    'a??o': 'ação', 'A??o': 'Ação', 'fic??o': 'ficção', 'miss?o': 'missão', 'cora??o': 'coração'
   };
-
   for (const [errado, certo] of Object.entries(correcoes)) {
     texto = texto.split(errado).join(certo);
   }
-
   return texto;
 }
 
@@ -827,47 +768,36 @@ async function buscarDetalhes(id, type) {
   const isBlockedPage = (html = '') => {
     const t = String(html).toLowerCase();
     return (
-      t.includes('you are unable to access') ||
-      t.includes('attention required') ||
+      t.includes('you are unable to access') || t.includes('attention required') ||
       t.includes('cf-browser-verification') ||
-      (t.includes('cloudflare') && t.includes('ray id')) ||
-      t.includes('access denied')
+      (t.includes('cloudflare') && t.includes('ray id')) || t.includes('access denied')
     );
   };
 
   const decodeHtml = (buffer) => {
     let html = null;
-    const encodings = ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1'];
-
-    for (const encoding of encodings) {
+    for (const encoding of ['ISO-8859-1', 'Windows-1252', 'UTF-8', 'latin1']) {
       try {
         const decoded = iconv.decode(Buffer.from(buffer), encoding);
-        if (!decoded.includes('â€') && !decoded.includes('?â€')) {
-          html = decoded;
-          break;
-        }
+        if (!decoded.includes('â€') && !decoded.includes('?â€')) { html = decoded; break; }
       } catch {}
     }
-
     if (!html) {
       html = iconv.decode(Buffer.from(buffer), 'ISO-8859-1');
       html = corrigirCaracteresEspeciais(html);
     }
-
     return html;
   };
 
   const fetchDetailHtml = async (detailPage, contentId, refererPage = 'movies') => {
     const attempts = [
       { url: `${BASE_URL}/index.php`, config: { params: { page: detailPage, id: contentId } } },
-      { url: `${BASE_URL}/`, config: { params: { page: detailPage, id: contentId } } }
+      { url: `${BASE_URL}/`,          config: { params: { page: detailPage, id: contentId } } }
     ];
-
     for (const attempt of attempts) {
       try {
-        const httpClient = getHttpClientForUrl(attempt.url);
-        const manualCookie = httpClient === clientNoJar;
-
+        const httpClient    = getHttpClientForUrl(attempt.url);
+        const manualCookie  = httpClient === clientNoJar;
         const resp = await httpClient.get(
           attempt.url,
           withOptionalResidentialProxy({
@@ -879,25 +809,19 @@ async function buscarDetalhes(id, type) {
               'Referer': `${BASE_URL}/?page=${refererPage}`,
               ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
             },
-            timeout: 30000,
-            responseType: 'arraybuffer',
-            validateStatus: s => s < 500
+            timeout: 30000, responseType: 'arraybuffer', validateStatus: s => s < 500
           }, attempt.url)
         );
-
         const html = decodeHtml(resp.data);
-
         if (isBlockedPage(html)) {
-          console.log(`⚠️ Página bloqueada detectada em ${attempt.url} (${detailPage}/${contentId}), tentando fallback...`);
+          console.log(`⚠️ Página bloqueada detectada em ${attempt.url}, tentando fallback...`);
           continue;
         }
-
         return html;
       } catch (e) {
-        console.log(`⚠️ Falha ao buscar ${detailPage}/${contentId} em ${attempt.url}: ${e.message}`);
+        console.log(`⚠️ Falha ao buscar ${detailPage}/${contentId}: ${e.message}`);
       }
     }
-
     return null;
   };
 
@@ -905,35 +829,23 @@ async function buscarDetalhes(id, type) {
     // 1) Worker
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log(`🔍 Buscando detalhes via Worker: ${type}/${id}...`);
-
       try {
         const response = await axios.post(
           `${CLOUDFLARE_WORKER_URL}/details-direct`,
           { id, type, cookies: SESSION_COOKIES },
           { timeout: 15000 }
         );
-
         const data = response.data;
         if (data.success && data.data) {
-          const d = data.data;
+          const d      = data.data;
           const titulo = String(d.title || '').toLowerCase();
-          const sinopse = String(d.info?.sinopse || '').toLowerCase();
-
-          const bloqueado =
-            titulo.includes('you are unable to access') ||
-            titulo.includes('access denied') ||
-            titulo.includes('attention required') ||
-            titulo.includes('cloudflare') ||
-            sinopse.includes('you are unable to access') ||
-            sinopse.includes('cloudflare');
-
-          const invalido = !d.title || d.title.length < 2 || (!d.seasons && !d.info);
-
+          const sinopse= String(d.info?.sinopse || '').toLowerCase();
+          const bloqueado = titulo.includes('you are unable to access') || titulo.includes('cloudflare') || sinopse.includes('cloudflare');
+          const invalido  = !d.title || d.title.length < 2 || (!d.seasons && !d.info);
           if (!bloqueado && !invalido) {
             console.log('✅ Detalhes obtidos via Worker');
             return d;
           }
-
           console.log('⚠️ Worker retornou conteúdo inválido/bloqueio, tentando direto...');
         }
       } catch (workerError) {
@@ -947,11 +859,7 @@ async function buscarDetalhes(id, type) {
     await logCurrentCookies(`detalhes-${type}-${id}`);
 
     let html = await fetchDetailHtml(pageType, id, type === 'movies' ? 'movies' : 'series');
-
-    if (!html) {
-      console.error(`❌ Não foi possível obter HTML de detalhes (${type}/${id})`);
-      return null;
-    }
+    if (!html) { console.error(`❌ Não foi possível obter HTML de detalhes (${type}/${id})`); return null; }
 
     let $ = cheerio.load(html, { decodeEntities: false });
 
@@ -961,35 +869,28 @@ async function buscarDetalhes(id, type) {
     }
 
     const data = { seasons: {}, info: {} };
-    data.title = limparTexto($('.left-wrap h2').first().text());
+    data.title        = limparTexto($('.left-wrap h2').first().text());
     data.info.sinopse = limparTexto($('.left-wrap p').first().text());
-    data.mediaType = $('.tab_episode').length > 0 ? 'series' : 'movie';
+    data.mediaType    = $('.tab_episode').length > 0 ? 'series' : 'movie';
 
     if (data.mediaType === 'movie') {
       const tags = [];
-      $('.left-wrap .tag').each((i, el) => {
-        const tagText = limparTexto($(el).text());
-        if (tagText) tags.push(tagText);
-      });
-
-      const imdbText = limparTexto($('.left-wrap .rnd').first().text());
+      $('.left-wrap .tag').each((i, el) => { const t = limparTexto($(el).text()); if (t) tags.push(t); });
+      const imdbText  = limparTexto($('.left-wrap .rnd').first().text());
       const imdbMatch = imdbText.match(/IMDB\s+([\d.]+)/i);
       if (imdbMatch) data.info.imdb = parseFloat(imdbMatch[1]);
 
       for (const tag of tags) {
         if (/^\d{4}$/.test(tag)) data.info.ano = parseInt(tag, 10);
-
         const duracaoMatch = tag.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
         if (duracaoMatch) {
-          const horas = parseInt(duracaoMatch[1], 10);
+          const horas   = parseInt(duracaoMatch[1], 10);
           const minutos = parseInt(duracaoMatch[2], 10);
-          const segundos = parseInt(duracaoMatch[3], 10);
-
+          const segundos= parseInt(duracaoMatch[3], 10);
           data.info.duracaoMinutos = (horas * 60) + minutos + Math.ceil(segundos / 60);
-          data.info.duracaoTexto = tag;
+          data.info.duracaoTexto   = tag;
           console.log(`✅ [FILME] Duração: ${tag} = ${data.info.duracaoMinutos}min`);
         }
-
         if (!tag.includes(':') && isNaN(tag) && !/^\d{4}$/.test(tag)) {
           if (!data.info.genero) data.info.genero = tag;
         }
@@ -999,14 +900,12 @@ async function buscarDetalhes(id, type) {
     if (data.mediaType === 'series') {
       $('.tab_episode').each((i, el) => {
         const seasonNum = i + 1;
-        const episodes = [];
-
+        const episodes  = [];
         $(el).find('a.ep-list-min').each((j, link) => {
-          const epId = $(link).attr('data-id');
+          const epId   = $(link).attr('data-id');
           const epName = limparTexto($(link).find('.ep-title').text());
           if (epId && epName) episodes.push({ name: epName, id: epId });
         });
-
         if (episodes.length > 0) data.seasons[seasonNum] = episodes;
       });
     } else {
@@ -1017,7 +916,6 @@ async function buscarDetalhes(id, type) {
       console.log('⚠️ HTML retornado sem título válido (possível bloqueio/sessão inválida)');
       return null;
     }
-
     return data;
   } catch (error) {
     console.error("❌ Erro ao buscar detalhes:", error.message);
@@ -1030,21 +928,15 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
   try {
     if (mediaType === 'movie' && duracaoDoHTML && duracaoDoHTML > 0) {
       console.log(`✅ [FILME] Usando duração exata: ${duracaoDoHTML}min`);
-
       await AssetSize.findOneAndUpdate(
         { assetId: id, mediaType: 'movie' },
         { bytes: duracaoDoHTML * 60 * 1024 * 1024 * 15, updatedAt: new Date() },
         { upsert: true, new: true }
       );
-
       return duracaoDoHTML;
     }
 
-    const cached = await AssetSize.findOne({
-      assetId: id,
-      mediaType: mediaType === 'movie' ? 'movie' : 'series_ep'
-    });
-
+    const cached = await AssetSize.findOne({ assetId: id, mediaType: mediaType === 'movie' ? 'movie' : 'series_ep' });
     if (cached && cached.bytes > 0) {
       const minutos = Math.round(cached.bytes / (1024 * 1024 * 15));
       const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
@@ -1053,94 +945,57 @@ async function estimarDuracao(mediaType, id, duracaoDoHTML = null) {
     }
 
     console.log(`🔍 Buscando tamanho via HEAD: ${id}...`);
-
-    const base = mediaType === 'movie' ? MOVIE_BASE : VIDEO_BASE;
-    const url = `${base}/${userSession.user}/${userSession.pass}/${id}.mp4`;
-
+    const base      = mediaType === 'movie' ? MOVIE_BASE : VIDEO_BASE;
+    const url       = `${base}/${userSession.user}/${userSession.pass}/${id}.mp4`;
     const httpClient = getHttpClientForUrl(url);
     const manualCookie = httpClient === clientNoJar;
 
-    // 1) HEAD
+    // HEAD
     try {
       const headResponse = await httpClient.head(
         url,
         withOptionalResidentialProxy({
-          headers: {
-            'User-Agent': HEADERS['User-Agent'],
-            'Referer': BASE_URL,
-            'Accept': '*/*',
-            ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
-          },
-          timeout: 10000,
-          maxRedirects: 5,
-          validateStatus: s => s < 500
+          headers: { 'User-Agent': HEADERS['User-Agent'], 'Referer': BASE_URL, 'Accept': '*/*', ...(manualCookie ? { Cookie: buildCookieHeader() } : {}) },
+          timeout: 10000, maxRedirects: 5, validateStatus: s => s < 500
         }, url)
       );
-
       let contentLength = parseInt(headResponse.headers['content-length'] || '0', 10);
-
       if (contentLength > 0) {
         const minutos = Math.round(contentLength / (1024 * 1024 * 15));
         const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
-
         await AssetSize.findOneAndUpdate(
           { assetId: id, mediaType: mediaType === 'movie' ? 'movie' : 'series_ep' },
-          { bytes: contentLength, updatedAt: new Date() },
-          { upsert: true, new: true }
+          { bytes: contentLength, updatedAt: new Date() }, { upsert: true, new: true }
         );
-
         console.log(`✅ Duração via HEAD: ${duracaoFinal}min`);
         return duracaoFinal;
       }
-
       throw new Error('HEAD sem content-length');
     } catch (headError) {
       console.log(`⚠️ HEAD falhou (${headError.message}), tentando GET Range...`);
     }
 
-    // 2) GET Range fallback
+    // GET Range fallback
     try {
       const rangeResponse = await httpClient.get(
         url,
         withOptionalResidentialProxy({
-          headers: {
-            'User-Agent': HEADERS['User-Agent'],
-            'Referer': BASE_URL,
-            'Accept': '*/*',
-            'Range': 'bytes=0-0',
-            ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
-          },
-          timeout: 12000,
-          maxRedirects: 5,
-          responseType: 'stream',
-          validateStatus: s => s < 500
+          headers: { 'User-Agent': HEADERS['User-Agent'], 'Referer': BASE_URL, 'Accept': '*/*', 'Range': 'bytes=0-0', ...(manualCookie ? { Cookie: buildCookieHeader() } : {}) },
+          timeout: 12000, maxRedirects: 5, responseType: 'stream', validateStatus: s => s < 500
         }, url)
       );
-
-      if (rangeResponse.data && typeof rangeResponse.data.destroy === 'function') {
-        rangeResponse.data.destroy();
-      }
-
+      if (rangeResponse.data && typeof rangeResponse.data.destroy === 'function') rangeResponse.data.destroy();
       let totalBytes = 0;
-      const cr = rangeResponse.headers['content-range']; // bytes 0-0/12345
-      if (cr) {
-        const m = String(cr).match(/\/(\d+)$/);
-        if (m) totalBytes = parseInt(m[1], 10);
-      }
-      if (!totalBytes) {
-        totalBytes = parseInt(rangeResponse.headers['content-length'] || '0', 10);
-      }
-
+      const cr = rangeResponse.headers['content-range'];
+      if (cr) { const m = String(cr).match(/\/(\d+)$/); if (m) totalBytes = parseInt(m[1], 10); }
+      if (!totalBytes) totalBytes = parseInt(rangeResponse.headers['content-length'] || '0', 10);
       if (totalBytes > 0) {
         const minutos = Math.round(totalBytes / (1024 * 1024 * 15));
         const duracaoFinal = Math.max(minutos, mediaType === 'movie' ? 90 : 20);
-
         await AssetSize.findOneAndUpdate(
           { assetId: id, mediaType: mediaType === 'movie' ? 'movie' : 'series_ep' },
-          { bytes: totalBytes, updatedAt: new Date() },
-          { upsert: true, new: true }
+          { bytes: totalBytes, updatedAt: new Date() }, { upsert: true, new: true }
         );
-
         console.log(`✅ Duração via GET Range: ${duracaoFinal}min`);
         return duracaoFinal;
       }
@@ -1163,11 +1018,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto',
-    cacheSize: {
-      movies: CACHE_CONTEUDO.movies.length,
-      series: CACHE_CONTEUDO.series.length
-    },
+    network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay scraping only)' : 'IP direto',
+    streaming: 'Signed redirect direto ao goplay.icu (zero banda VPS)',
+    signedUrlTTL: `${SIGNED_URL_TTL}s`,
+    cacheSize: { movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length },
     session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
   });
 });
@@ -1177,16 +1031,9 @@ app.get('/health', (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-
-    if (!username || !password) {
-      return res.json({ status: 'error', message: 'Usuário e senha são obrigatórios' });
-    }
-
+    if (!username || !password) return res.json({ status: 'error', message: 'Usuário e senha são obrigatórios' });
     const success = await fazerLoginVouver(username, password);
-    res.json({
-      status: success ? 'success' : 'error',
-      message: success ? 'Login realizado com sucesso' : 'Falha no login'
-    });
+    res.json({ status: success ? 'success' : 'error', message: success ? 'Login realizado com sucesso' : 'Falha no login' });
   } catch (error) {
     console.error('Erro no endpoint /api/login:', error);
     res.json({ status: 'error', message: 'Erro ao fazer login' });
@@ -1197,11 +1044,9 @@ app.get('/api/list', async (req, res) => {
   try {
     const { type = 'movies', page = 1, q } = req.query;
     const pageNum = parseInt(page, 10) || 1;
-    const limit = 20;
+    const limit   = 20;
 
-    if (CACHE_CONTEUDO.series.length === 0) {
-      await atualizarCache();
-    }
+    if (CACHE_CONTEUDO.series.length === 0) await atualizarCache();
 
     const isAdulto = n => /[\[\(]xxx|\+18|adulto|hentai/i.test(String(n).toUpperCase());
 
@@ -1212,9 +1057,7 @@ app.get('/api/list', async (req, res) => {
       lista = (CACHE_CONTEUDO[type] || []).filter(i => !isAdulto(i.name));
     }
 
-    if (q) {
-      lista = lista.filter(i => i.name.toLowerCase().includes(String(q).toLowerCase()));
-    }
+    if (q) lista = lista.filter(i => i.name.toLowerCase().includes(String(q).toLowerCase()));
 
     const total = lista.length;
     const items = lista.slice((pageNum - 1) * limit, pageNum * limit);
@@ -1223,21 +1066,14 @@ app.get('/api/list', async (req, res) => {
       const folder = type === 'adult'
         ? (CACHE_CONTEUDO.movies.find(m => m.id === item.id) ? 'movies' : 'series')
         : type;
-
       const coverPath = path.join(__dirname, 'public', 'covers', folder, `${item.id}.jpg`);
       const img = fs.existsSync(coverPath)
         ? `/covers/${folder}/${item.id}.jpg`
         : 'https://via.placeholder.com/300x450?text=' + encodeURIComponent(item.name);
-
       return { id: item.id, title: item.name, img, type: folder };
     });
 
-    res.json({
-      data,
-      currentPage: pageNum,
-      totalPages: Math.ceil(total / limit),
-      totalItems: total
-    });
+    res.json({ data, currentPage: pageNum, totalPages: Math.ceil(total / limit), totalItems: total });
   } catch (error) {
     console.error('Erro no endpoint /api/list:', error);
     res.status(500).json({ error: 'Erro ao listar conteúdo' });
@@ -1247,17 +1083,9 @@ app.get('/api/list', async (req, res) => {
 app.get('/api/details', async (req, res) => {
   try {
     const { id, type } = req.query;
-
-    if (!id || !type) {
-      return res.status(400).json({ error: 'ID e tipo são obrigatórios' });
-    }
-
+    if (!id || !type) return res.status(400).json({ error: 'ID e tipo são obrigatórios' });
     const detalhes = await buscarDetalhes(id, type);
-
-    if (!detalhes) {
-      return res.status(404).json({ error: 'Conteúdo não encontrado' });
-    }
-
+    if (!detalhes) return res.status(404).json({ error: 'Conteúdo não encontrado' });
     res.json(detalhes);
   } catch (error) {
     console.error('Erro no endpoint /api/details:', error);
@@ -1268,20 +1096,21 @@ app.get('/api/details', async (req, res) => {
 // ===== ENDPOINT: Player com Video.js =====
 app.get('/player/:token', async (req, res) => {
   try {
-    const decoded = jwt.verify(req.params.token, JWT_SECRET);
+    const decoded  = jwt.verify(req.params.token, JWT_SECRET);
     const { videoId, mediaType, userId } = decoded;
 
     const purchase = await PurchasedContent.findOne({ token: req.params.token });
-    if (!purchase) throw new Error('Conteúdo não encontrado');
+    if (!purchase)                   throw new Error('Conteúdo não encontrado');
     if (new Date() > purchase.expiresAt) throw new Error('Link expirado');
 
     const user = await User.findOne({ userId });
-    if (!user || user.isBlocked) throw new Error('Usuário bloqueado');
+    if (!user || user.isBlocked)     throw new Error('Usuário bloqueado');
 
-    purchase.viewed = true;
+    purchase.viewed    = true;
     purchase.viewCount += 1;
     await purchase.save();
 
+    // O endpoint /api/stream-secure agora retorna 302 redirect — sem banda da VPS
     const streamPath = `/api/stream-secure/${req.params.token}/${purchase.sessionToken}`;
 
     res.send(`
@@ -1301,33 +1130,31 @@ app.get('/player/:token', async (req, res) => {
       min-height: 100vh; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #fff; user-select: none;
     }
     .container { width: 100%; max-width: 1400px; padding: 20px; position: relative; }
-    .logo { color: #E50914; font-size: 36px; font-weight: bold; text-align: center; margin-bottom: 30px; text-shadow: 0 0 20px rgba(229, 9, 20, 0.5); }
+    .logo { color: #E50914; font-size: 36px; font-weight: bold; text-align: center; margin-bottom: 30px; text-shadow: 0 0 20px rgba(229,9,20,0.5); }
     .video-wrapper { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.8); }
     .video-js { width: 100%; height: 80vh; font-family: 'Segoe UI', Arial, sans-serif; }
     .vjs-theme-fasttv .vjs-control-bar { background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0.7) 50%, transparent 100%); height: 4em; }
-    .vjs-theme-fasttv .vjs-big-play-button { background: rgba(229, 9, 20, 0.9); border: none; border-radius: 50%; width: 2em; height: 2em; line-height: 2em; font-size: 3em; left: 50%; top: 50%; transform: translate(-50%, -50%); transition: all 0.3s; }
-    .vjs-theme-fasttv .vjs-big-play-button:hover { background: rgba(229, 9, 20, 1); transform: translate(-50%, -50%) scale(1.1); }
+    .vjs-theme-fasttv .vjs-big-play-button { background: rgba(229,9,20,0.9); border: none; border-radius: 50%; width: 2em; height: 2em; line-height: 2em; font-size: 3em; left: 50%; top: 50%; transform: translate(-50%,-50%); transition: all 0.3s; }
+    .vjs-theme-fasttv .vjs-big-play-button:hover { background: rgba(229,9,20,1); transform: translate(-50%,-50%) scale(1.1); }
     .vjs-theme-fasttv .vjs-play-progress, .vjs-theme-fasttv .vjs-volume-level { background-color: #E50914; }
     .info-bar { background: rgba(20,20,20,0.95); backdrop-filter: blur(10px); padding: 20px; border-radius: 12px; margin-top: 20px; border: 1px solid rgba(255,255,255,0.1); }
     .title { font-size: 24px; font-weight: bold; margin-bottom: 10px; color: #fff; }
     .meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 14px; color: #aaa; margin-bottom: 15px; }
     .meta span { display: flex; align-items: center; gap: 8px; }
-    .warning { text-align: center; margin-top: 20px; padding: 15px; background: rgba(229, 9, 20, 0.1); border-radius: 8px; font-size: 14px; border: 1px solid rgba(229, 9, 20, 0.3); }
-    .timer { display: inline-block; background: rgba(229, 9, 20, 0.2); padding: 5px 12px; border-radius: 20px; font-weight: bold; }
+    .warning { text-align: center; margin-top: 20px; padding: 15px; background: rgba(229,9,20,0.1); border-radius: 8px; font-size: 14px; border: 1px solid rgba(229,9,20,0.3); }
+    .timer { display: inline-block; background: rgba(229,9,20,0.2); padding: 5px 12px; border-radius: 20px; font-weight: bold; }
     @media (max-width: 768px) { .video-js { height: 50vh; } }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="logo">FAST<span style="color: #fff">TV</span></div>
-
+    <div class="logo">FAST<span style="color:#fff">TV</span></div>
     <div class="video-wrapper">
       <video id="player" class="video-js vjs-theme-fasttv vjs-big-play-centered" controls preload="auto"
-        data-setup='{"fluid": true, "aspectRatio": "16:9", "playbackRates": [0.5,0.75,1,1.25,1.5,2]}'>
+        data-setup='{"fluid":true,"aspectRatio":"16:9","playbackRates":[0.5,0.75,1,1.25,1.5,2]}'>
         <source src="${streamPath}" type="video/mp4">
       </video>
     </div>
-
     <div class="info-bar">
       <div class="title">${purchase.title}</div>
       ${purchase.episodeName ? `<div class="meta"><span><i class="fas fa-tv"></i> ${purchase.episodeName}</span></div>` : ''}
@@ -1337,13 +1164,11 @@ app.get('/player/:token', async (req, res) => {
         <span><i class="fas fa-eye"></i> ${purchase.viewCount} visualizaç${purchase.viewCount === 1 ? 'ão' : 'ões'}</span>
       </div>
     </div>
-
     <div class="warning">
       <i class="fas fa-shield-alt"></i>
-      Este link é pessoal e intransferível • Protegido por DRM • ID: ${userId}
+      Este link é pessoal e intransferível • Protegido por assinatura HMAC • ID: ${userId}
     </div>
   </div>
-
   <script src="https://vjs.zencdn.net/8.10.0/video.min.js"></script>
   <script>
     const expiresAt = new Date('${purchase.expiresAt.toISOString()}');
@@ -1351,7 +1176,11 @@ app.get('/player/:token', async (req, res) => {
 
     document.addEventListener('DOMContentLoaded', function() {
       player = videojs('player');
-      player.el().addEventListener('contextmenu', function(e){ e.preventDefault(); return false; });
+      player.el().addEventListener('contextmenu', e => { e.preventDefault(); return false; });
+
+      // Força carregamento imediato — a URL assinada expira em ${SIGNED_URL_TTL}s
+      // O Video.js segue o 302 redirect e obtém a URL real do goplay.icu
+      player.ready(function() { player.load(); });
 
       let playLogged = false;
       player.on('play', function() {
@@ -1359,31 +1188,37 @@ app.get('/player/:token', async (req, res) => {
           fetch('/api/log-view', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: ${userId},
-              videoId: '${videoId}',
-              token: '${req.params.token}',
-              timestamp: Date.now()
-            })
+            body: JSON.stringify({ userId: ${userId}, videoId: '${videoId}', token: '${req.params.token}', timestamp: Date.now() })
           });
           playLogged = true;
+        }
+      });
+
+      // Se o stream falhar (URL expirou antes de iniciar), recarrega o src
+      player.on('error', function() {
+        const err = player.error();
+        if (err && (err.code === 2 || err.code === 4)) {
+          console.log('⚠️ Erro no stream, recarregando link...');
+          fetch('/api/refresh-stream/${req.params.token}/${purchase.sessionToken}')
+            .then(r => r.json())
+            .then(d => { if (d.url) { player.src({ src: d.url, type: 'video/mp4' }); player.play(); } })
+            .catch(() => {});
         }
       });
     });
 
     function updateCountdown() {
-      const now = new Date();
+      const now  = new Date();
       const diff = expiresAt - now;
       if (diff <= 0) {
         document.getElementById('countdown').innerText = 'EXPIRADO';
         if (player) { player.pause(); player.dispose(); }
         return;
       }
-      const hours = Math.floor(diff / (1000*60*60));
+      const hours   = Math.floor(diff / (1000*60*60));
       const minutes = Math.floor((diff % (1000*60*60)) / (1000*60));
       document.getElementById('countdown').innerText = hours + 'h ' + minutes + 'm';
     }
-
     updateCountdown();
     setInterval(updateCountdown, 60000);
   </script>
@@ -1396,26 +1231,17 @@ app.get('/player/:token', async (req, res) => {
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <title>Acesso Negado - FastTV</title>
-  <style>
-    body { background:#0a0a0a; color:#fff; display:flex; justify-content:center; align-items:center; height:100vh; font-family:Arial,sans-serif; text-align:center; }
-    .error { max-width:600px; padding:40px; }
-    h1 { color:#E50914; margin-bottom:20px; }
-  </style>
+  <meta charset="UTF-8"><title>Acesso Negado - FastTV</title>
+  <style>body{background:#0a0a0a;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;font-family:Arial,sans-serif;text-align:center}.error{max-width:600px;padding:40px}h1{color:#E50914;margin-bottom:20px}</style>
 </head>
-<body>
-  <div class="error">
-    <h1>⚠️ Acesso Negado</h1>
-    <p>Link inválido, expirado ou usuário bloqueado.</p>
-  </div>
-</body>
-</html>
-    `);
+<body><div class="error"><h1>⚠️ Acesso Negado</h1><p>Link inválido, expirado ou usuário bloqueado.</p></div></body>
+</html>`);
   }
 });
 
-// ===== ENDPOINT: Streaming Progressivo Seguro =====
+// ===== ENDPOINT: Signed Redirect — ZERO BANDA NA VPS =====
+// Valida JWT + compra, depois emite 302 com URL HMAC-assinada direto ao goplay.icu.
+// O vídeo flui: cliente → goplay.icu (sem passar pela VPS).
 app.get('/api/stream-secure/:token/:sessionToken',
   detectSuspiciousClient,
   advancedRateLimit,
@@ -1427,11 +1253,7 @@ app.get('/api/stream-secure/:token/:sessionToken',
       const decoded = jwt.verify(contentToken, JWT_SECRET);
       const { videoId, mediaType, userId } = decoded;
 
-      const purchase = await PurchasedContent.findOne({
-        token: contentToken,
-        sessionToken
-      });
-
+      const purchase = await PurchasedContent.findOne({ token: contentToken, sessionToken });
       if (!purchase || new Date() > purchase.expiresAt) {
         console.log('⚠️ Conteúdo expirado ou não encontrado');
         return res.sendStatus(403);
@@ -1443,54 +1265,50 @@ app.get('/api/stream-secure/:token/:sessionToken',
         return res.sendStatus(403);
       }
 
-      const base = mediaType === 'movie' ? MOVIE_BASE : VIDEO_BASE;
-      const videoUrl = `${base}/${userSession.user}/${userSession.pass}/${videoId}.mp4`;
+      const signedUrl  = gerarUrlAssinada(videoId, userId, mediaType);
 
-      await refreshSessionCookiesFromJar();
-      await logCurrentCookies(`stream-${videoId}`);
+      console.log(`🔀 Redirect assinado: User ${userId} | Vídeo ${videoId} | TTL ${SIGNED_URL_TTL}s`);
 
-      const httpClient = getHttpClientForUrl(videoUrl);
-      const manualCookie = httpClient === clientNoJar;
-
-      console.log(`🎬 Streaming: ${videoId} | User: ${userId} | Proxy: ${manualCookie ? 'ON' : 'OFF'}`);
-
-      const response = await httpClient.get(
-        videoUrl,
-        withOptionalResidentialProxy({
-          responseType: 'stream',
-          headers: {
-            Range: req.headers.range,
-            'User-Agent': HEADERS['User-Agent'],
-            Referer: `${BASE_URL}/index.php?page=homepage`,
-            Accept: '*/*',
-            ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
-          },
-          timeout: 30000,
-          validateStatus: s => s < 500
-        }, videoUrl)
-      );
-
-      if (response.status >= 400) {
-        console.log(`⚠️ Upstream retornou ${response.status} para ${videoId}`);
-        return res.sendStatus(403);
-      }
-
-      ['content-range', 'accept-ranges', 'content-length', 'content-type'].forEach(h => {
-        if (response.headers[h]) res.setHeader(h, response.headers[h]);
-      });
-
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+      // Anti-cache: cada redirect gera uma URL única (exp muda a cada chamada)
+      res.setHeader('Cache-Control', 'no-store, no-cache, private, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
 
-      res.status(response.status || 200);
-      response.data.pipe(res);
+      res.redirect(302, signedUrl);
 
     } catch (error) {
-      console.error('Erro no streaming:', error.message);
-      if (error.response) console.error('Status upstream:', error.response.status);
+      console.error('Erro no stream redirect:', error.message);
       res.sendStatus(403);
+    }
+  }
+);
+
+// ===== ENDPOINT: Refresh do link de stream (fallback se URL expirou antes do play) =====
+// Chamado pelo player via fetch quando ocorre erro de carregamento.
+app.get('/api/refresh-stream/:token/:sessionToken',
+  detectSuspiciousClient,
+  async (req, res) => {
+    try {
+      const contentToken = req.params.token;
+      const sessionToken = req.params.sessionToken;
+
+      const decoded = jwt.verify(contentToken, JWT_SECRET);
+      const { videoId, mediaType, userId } = decoded;
+
+      const purchase = await PurchasedContent.findOne({ token: contentToken, sessionToken });
+      if (!purchase || new Date() > purchase.expiresAt) return res.status(403).json({ error: 'Expirado' });
+
+      const user = await User.findOne({ userId });
+      if (!user || user.isBlocked) return res.status(403).json({ error: 'Bloqueado' });
+
+      const signedUrl = gerarUrlAssinada(videoId, userId, mediaType);
+
+      console.log(`🔄 Refresh de stream: User ${userId} | Vídeo ${videoId}`);
+      res.json({ url: signedUrl });
+
+    } catch (error) {
+      console.error('Erro no refresh-stream:', error.message);
+      res.status(403).json({ error: 'Inválido' });
     }
   }
 );
@@ -1500,19 +1318,14 @@ app.post('/api/log-view', async (req, res) => {
     const { userId, videoId } = req.body;
     console.log(`📊 Play: User ${userId} | Vídeo ${videoId}`);
     res.sendStatus(200);
-  } catch {
-    res.sendStatus(500);
-  }
+  } catch { res.sendStatus(500); }
 });
 
 // ===== API ADMINISTRATIVA =====
 function adminAuth(req, res, next) {
-  const authToken = req.headers['authorization'];
+  const authToken  = req.headers['authorization'];
   const validToken = process.env.ADMIN_API_TOKEN || 'seu-token-super-secreto';
-
-  if (authToken !== `Bearer ${validToken}`) {
-    return res.status(401).json({ error: 'Não autorizado' });
-  }
+  if (authToken !== `Bearer ${validToken}`) return res.status(401).json({ error: 'Não autorizado' });
   next();
 }
 
@@ -1520,26 +1333,23 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
     const stats = {
       users: {
-        total: await User.countDocuments(),
-        active: await User.countDocuments({ isActive: true, isBlocked: false }),
+        total:   await User.countDocuments(),
+        active:  await User.countDocuments({ isActive: true, isBlocked: false }),
         blocked: await User.countDocuments({ isBlocked: true })
       },
       purchases: {
-        total: (await User.aggregate([{ $group: { _id: null, total: { $sum: '$totalPurchases' } } }]))[0]?.total || 0,
+        total:   (await User.aggregate([{ $group: { _id: null, total: { $sum: '$totalPurchases' } } }]))[0]?.total || 0,
         revenue: (await User.aggregate([{ $group: { _id: null, total: { $sum: '$totalSpent' } } }]))[0]?.total || 0
       },
       content: {
-        active: await PurchasedContent.countDocuments({ expiresAt: { $gt: new Date() } }),
+        active:  await PurchasedContent.countDocuments({ expiresAt: { $gt: new Date() } }),
         expired: await PurchasedContent.countDocuments({ expiresAt: { $lte: new Date() } })
       },
-      catalog: {
-        movies: CACHE_CONTEUDO.movies.length,
-        series: CACHE_CONTEUDO.series.length
-      },
-      network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto',
-      session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
+      catalog: { movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length },
+      network:  residentialProxyAgent ? 'Proxy residencial (scraping only)' : 'IP direto',
+      streaming: `Signed redirect → goplay.icu direto (TTL: ${SIGNED_URL_TTL}s)`,
+      session:   SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
-
     res.json(stats);
   } catch (error) {
     console.error('Erro ao buscar estatísticas:', error);
@@ -1551,13 +1361,7 @@ app.post('/api/admin/refresh-cache', adminAuth, async (req, res) => {
   try {
     console.log('🔄 Recarregando cache manualmente...');
     await atualizarCache();
-
-    res.json({
-      success: true,
-      movies: CACHE_CONTEUDO.movies.length,
-      series: CACHE_CONTEUDO.series.length,
-      lastUpdated: CACHE_CONTEUDO.lastUpdated
-    });
+    res.json({ success: true, movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length, lastUpdated: CACHE_CONTEUDO.lastUpdated });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1566,10 +1370,8 @@ app.post('/api/admin/refresh-cache', adminAuth, async (req, res) => {
 // ===== WEBHOOK MERCADO PAGO =====
 app.post('/webhook/mercadopago', async (req, res) => {
   console.log('📥 Webhook do Mercado Pago recebido');
-
   try {
     let paymentId;
-
     if (req.body.type === 'payment' && req.body.data?.id) {
       paymentId = req.body.data.id;
     } else if (req.body.action === 'payment.updated' && req.body.data?.id) {
@@ -1583,66 +1385,41 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
-        timeout: 10000
-      }
+      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` }, timeout: 10000 }
     );
-
     const payment = response.data;
 
     if (payment.status === 'approved') {
       const userId = parseInt(payment.external_reference, 10);
       const amount = Math.round(payment.transaction_amount * 100);
-
       if (!userId || !amount) return res.sendStatus(200);
-
       const sucesso = await telegramBot.processarPagamentoAprovado(paymentId, userId, amount);
-      if (sucesso) {
-        console.log(`✅ Créditos adicionados: User ${userId} | Valor: R$ ${(amount / 100).toFixed(2)}`);
-      }
+      if (sucesso) console.log(`✅ Créditos adicionados: User ${userId} | Valor: R$ ${(amount / 100).toFixed(2)}`);
     }
   } catch (error) {
     console.error('❌ Erro ao processar webhook:', error.message);
   }
-
   res.sendStatus(200);
 });
 
 // ===== LIMPEZA AUTOMÁTICA =====
 setInterval(async () => {
   try {
-    const result = await RateLimit.deleteMany({
-      blocked: false,
-      'requests.0': { $exists: false }
-    });
-
-    if (result.deletedCount > 0) {
-      console.log(`🧹 Removidos ${result.deletedCount} rate limiters inativos`);
-    }
-  } catch (error) {
-    console.error('Erro ao limpar rate limiters:', error);
-  }
+    const result = await RateLimit.deleteMany({ blocked: false, 'requests.0': { $exists: false } });
+    if (result.deletedCount > 0) console.log(`🧹 Removidos ${result.deletedCount} rate limiters inativos`);
+  } catch (error) { console.error('Erro ao limpar rate limiters:', error); }
 }, 60 * 60 * 1000);
 
 setInterval(async () => {
   try {
-    const resultado = await PurchasedContent.deleteMany({
-      expiresAt: { $lt: new Date() }
-    });
-
-    if (resultado.deletedCount > 0) {
-      console.log(`🧹 Removidos ${resultado.deletedCount} conteúdos expirados`);
-    }
-  } catch (error) {
-    console.error('Erro ao limpar conteúdos expirados:', error);
-  }
+    const resultado = await PurchasedContent.deleteMany({ expiresAt: { $lt: new Date() } });
+    if (resultado.deletedCount > 0) console.log(`🧹 Removidos ${resultado.deletedCount} conteúdos expirados`);
+  } catch (error) { console.error('Erro ao limpar conteúdos expirados:', error); }
 }, 60 * 60 * 1000);
 
 // ===== INICIALIZAÇÃO =====
 async function iniciarServidor() {
   try {
-    // sessão via .env
     if (SESSION_COOKIES_ENV) {
       console.log('🍪 SESSION_COOKIES encontrado no .env — hidratando CookieJar e pulando login...');
       await hydrateJarFromCookieString(SESSION_COOKIES_ENV, BASE_URL);
@@ -1654,12 +1431,11 @@ async function iniciarServidor() {
 
       userSession.user = LOGIN_USER;
       userSession.pass = LOGIN_PASS;
-
       await refreshSessionCookiesFromJar();
       await logCurrentCookies('boot-env-session');
-
       console.log('✅ Sessão carregada do .env com sucesso!');
       await atualizarCache();
+
     } else if (LOGIN_USER && LOGIN_PASS) {
       console.log('🔐 SESSION_COOKIES não definido — tentando login automático...');
       const loginSucesso = await fazerLoginVouver(LOGIN_USER, LOGIN_PASS);
@@ -1672,7 +1448,6 @@ async function iniciarServidor() {
         console.error('Solução: rode capturar-cookies.js localmente');
         console.error('e cole SESSION_COOKIES=... no .env do servidor.');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
         userSession.user = LOGIN_USER;
         userSession.pass = LOGIN_PASS;
       }
@@ -1686,19 +1461,18 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server - Proxy Aware Edition!');
+      console.log('🚀 FastTV Server — Signed Redirect Edition');
       console.log('='.repeat(60));
-      console.log(`📡 Servidor: ${DOMINIO_PUBLICO}`);
-      console.log(`🔒 Streaming Progressivo: Ativo`);
-      console.log(`🌐 Rede: ${residentialProxyAgent ? 'Proxy residencial (vouver/goplay)' : 'IP direto'}`);
-      console.log(`☁️ Worker: ${CLOUDFLARE_WORKER_URL ? 'Ativo (fallback)' : 'Inativo'}`);
-      console.log(`🎬 Player: Video.js com proteção DRM`);
-      console.log(`💰 Preços: R$ 2,50/hora (Cálculo proporcional)`);
-      console.log(`📝 Encoding: UTF-8 corrigido`);
-      console.log(`⏱️ Duração: Exata para filmes (HTML + fallback HEAD/Range)`);
-      console.log(`🤖 Bot: Ativo`);
-      console.log(`💳 PIX: ${MP_ACCESS_TOKEN ? 'Ativo' : 'Inativo'}`);
-      console.log(`📊 Cache: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
+      console.log(`📡 Servidor:      ${DOMINIO_PUBLICO}`);
+      console.log(`🔀 Streaming:     302 redirect → goplay.icu direto`);
+      console.log(`🔐 Assinatura:    HMAC-SHA256 / TTL ${SIGNED_URL_TTL}s`);
+      console.log(`🌐 Rede scraping: ${residentialProxyAgent ? 'Proxy residencial' : 'IP direto'}`);
+      console.log(`☁️ Worker:        ${CLOUDFLARE_WORKER_URL ? 'Ativo' : 'Inativo'}`);
+      console.log(`🎬 Player:        Video.js com refresh automático`);
+      console.log(`💰 Preços:        R$ 2,50/hora (cálculo proporcional)`);
+      console.log(`🤖 Bot:           Ativo`);
+      console.log(`💳 PIX:           ${MP_ACCESS_TOKEN ? 'Ativo' : 'Inativo'}`);
+      console.log(`📊 Cache:         ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
       console.log('='.repeat(60) + '\n');
     });
 
@@ -1713,13 +1487,7 @@ async function iniciarServidor() {
   }
 }
 
-process.on('unhandledRejection', (reason) => {
-  console.error('❌ Unhandled Rejection:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  process.exit(1);
-});
+process.on('unhandledRejection', (reason) => { console.error('❌ Unhandled Rejection:', reason); });
+process.on('uncaughtException',  (error)  => { console.error('❌ Uncaught Exception:', error); process.exit(1); });
 
 iniciarServidor();
