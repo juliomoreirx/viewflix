@@ -561,7 +561,7 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
       await refreshSessionCookiesFromJar();
       await logCurrentCookies('login-sucesso');
       console.log(`🍪 SESSION_COOKIES atualizado (${SESSION_COOKIES.length} chars)`);
-      await atualizarCache();
+      await atualizarCache(true);
       return true;
     }
 
@@ -586,12 +586,19 @@ async function fazerLoginVouver(username, password, tentativa = 1) {
 }
 
 // ===== FUNÇÃO: ATUALIZAR CACHE =====
-async function atualizarCache() {
+async function atualizarCache(forceDownload = false) {
   console.log("🔄 Atualizando cache de conteúdo...");
 
   try {
     const contentPath = path.join(__dirname, 'content.json');
 
+    // 1. Apaga o arquivo antigo se forçado (ex: na inicialização)
+    if (forceDownload && fs.existsSync(contentPath)) {
+      console.log('🗑️ Apagando content.json existente para baixar uma nova versão limpa...');
+      fs.unlinkSync(contentPath);
+    }
+
+    // 2. Tenta carregar do arquivo se ele existir
     if (fs.existsSync(contentPath)) {
       console.log('📦 Carregando catálogo do arquivo content.json...');
       try {
@@ -619,6 +626,7 @@ async function atualizarCache() {
       }
     }
 
+    // 3. Tenta via Cloudflare Worker (se estiver configurado)
     if (CLOUDFLARE_WORKER_URL && SESSION_COOKIES) {
       console.log('☁️ Tentando buscar cache via Cloudflare Worker...');
       try {
@@ -640,12 +648,8 @@ async function atualizarCache() {
             console.log(`✅ Cache obtido via Worker: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
 
             try {
-              fs.writeFileSync(contentPath, JSON.stringify({
-                status: true, error: null,
-                data: { movies: rawMovies, series: rawSeries },
-                lastUpdated: new Date().toISOString()
-              }, null, 2), 'utf8');
-              console.log('💾 Cache salvo em content.json');
+              fs.writeFileSync(contentPath, JSON.stringify(data.data, null, 2), 'utf8');
+              console.log('💾 Cache salvo estruturado em content.json');
             } catch { console.log('⚠️ Não foi possível salvar content.json'); }
             return;
           }
@@ -655,11 +659,14 @@ async function atualizarCache() {
       }
     }
 
+    // 4. Busca diretamente da API Vouver (Endpoint AJAX)
     if (SESSION_COOKIES) {
-      console.log('🌐 Buscando cache diretamente...');
+      console.log('🌐 Buscando cache diretamente da API...');
       try {
         await refreshSessionCookiesFromJar();
-        const searchUrl  = `${BASE_URL}/app/_search.php?q=a`;
+        
+        // Passando q=a para trazer o catálogo de forma ampla
+        const searchUrl  = `${BASE_URL}/ajax/search.php?q=a`;
         const httpClient = getHttpClientForUrl(searchUrl);
         const manualCookie = httpClient === clientNoJar;
 
@@ -668,18 +675,26 @@ async function atualizarCache() {
           withOptionalResidentialProxy({
             headers: {
               'User-Agent': HEADERS['User-Agent'],
-              'Accept': 'application/json, text/plain, */*',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
               'Referer': `${BASE_URL}/index.php?page=homepage`,
+              'X-Requested-With': 'XMLHttpRequest',
               ...(manualCookie ? { Cookie: buildCookieHeader() } : {})
             },
-            timeout: 30000, validateStatus: s => s < 500
+            timeout: 60000, // Aumentado para 60s devido ao JSON ser pesado
+            validateStatus: s => s < 500
           }, searchUrl)
         );
 
         const cacheData = cacheResponse.data;
         let rawMovies = [], rawSeries = [];
-        if (cacheData.data) { rawMovies = cacheData.data.movies || []; rawSeries = cacheData.data.series || []; }
-        else if (cacheData.movies) { rawMovies = cacheData.movies; rawSeries = cacheData.series; }
+        
+        if (cacheData.data) { 
+          rawMovies = cacheData.data.movies || []; 
+          rawSeries = cacheData.data.series || []; 
+        } else if (cacheData.movies) { 
+          rawMovies = cacheData.movies; 
+          rawSeries = cacheData.series; 
+        }
 
         if (rawMovies.length > 0 || rawSeries.length > 0) {
           CACHE_CONTEUDO.movies      = rawMovies.sort((a, b) => a.name.localeCompare(b.name));
@@ -688,13 +703,12 @@ async function atualizarCache() {
           console.log(`✅ Cache obtido diretamente: ${CACHE_CONTEUDO.movies.length} filmes | ${CACHE_CONTEUDO.series.length} séries`);
 
           try {
-            fs.writeFileSync(contentPath, JSON.stringify({
-              status: true, error: null,
-              data: { movies: rawMovies, series: rawSeries },
-              lastUpdated: new Date().toISOString()
-            }, null, 2), 'utf8');
-            console.log('💾 Cache salvo em content.json');
-          } catch { console.log('⚠️ Não foi possível salvar content.json'); }
+            // Salva a resposta inteira da API exatamente como chegou, mas com indentação de 2 espaços
+            fs.writeFileSync(contentPath, JSON.stringify(cacheData, null, 2), 'utf8');
+            console.log('💾 JSON completo salvo e formatado (prettified) em content.json');
+          } catch (fsError) { 
+            console.log('⚠️ Não foi possível salvar content.json:', fsError.message); 
+          }
           return;
         }
       } catch (directError) {
@@ -1012,7 +1026,7 @@ app.get('/api/list', async (req, res) => {
     const pageNum = parseInt(page, 10) || 1;
     const limit   = 20;
 
-    if (CACHE_CONTEUDO.series.length === 0) await atualizarCache();
+    if (CACHE_CONTEUDO.series.length === 0) await atualizarCache(true);
 
     const isAdulto = n => /[\[\(]xxx|\+18|adulto|hentai/i.test(String(n).toUpperCase());
 
@@ -1460,7 +1474,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 app.post('/api/admin/refresh-cache', adminAuth, async (req, res) => {
   try {
     console.log('🔄 Recarregando cache manualmente...');
-    await atualizarCache();
+    await atualizarCache(true);
     res.json({ success: true, movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length, lastUpdated: CACHE_CONTEUDO.lastUpdated });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1534,7 +1548,7 @@ async function iniciarServidor() {
       await refreshSessionCookiesFromJar();
       await logCurrentCookies('boot-env-session');
       console.log('✅ Sessão carregada do .env com sucesso!');
-      await atualizarCache();
+      await atualizarCache(true);
 
     } else if (LOGIN_USER && LOGIN_PASS) {
       console.log('🔐 SESSION_COOKIES não definido — tentando login automático...');
@@ -1577,7 +1591,7 @@ async function iniciarServidor() {
 
     setInterval(async () => {
       console.log('🔄 Atualização automática do cache (6h)...');
-      await atualizarCache();
+      await atualizarCache(true);
     }, 6 * 60 * 60 * 1000);
 
   } catch (error) {
