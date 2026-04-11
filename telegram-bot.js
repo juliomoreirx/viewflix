@@ -1218,16 +1218,23 @@ bot.on('message', async (msg) => {
     const loadingMsg = await bot.sendMessage(chatId, '🔍 Buscando...');
     if (vouverService.CACHE_CONTEUDO.series.length === 0) await vouverService.atualizarCache();
 
-    const termo   = text.toLowerCase().trim();
+// Usa a nossa nova função para limpar o termo buscado
+    const termoBusca = removerAcentos(text);
     const isAdulto = (nome) => /[\[\(]xxx|\+18|adulto|hentai|playboy|brasileirinhas/i.test(nome);
     let resultados = [];
 
     if (state.step === 'search_adult') {
       const todosItens = [...vouverService.CACHE_CONTEUDO.movies, ...vouverService.CACHE_CONTEUDO.series];
-      resultados = todosItens.filter(i => isAdulto(i.name) && i.name.toLowerCase().includes(termo)).slice(0, 15);
+      // Limpa o nome do filme (i.name) antes de comparar com o termoBusca
+      resultados = todosItens
+        .filter(i => isAdulto(i.name) && removerAcentos(i.name).includes(termoBusca))
+        .slice(0, 15);
     } else {
       const lista = vouverService.CACHE_CONTEUDO[state.step === 'search_movies' ? 'movies' : 'series'];
-      resultados  = lista.filter(i => !isAdulto(i.name) && i.name.toLowerCase().includes(termo)).slice(0, 15);
+      // Limpa o nome do filme (i.name) antes de comparar com o termoBusca
+      resultados = lista
+        .filter(i => !isAdulto(i.name) && removerAcentos(i.name).includes(termoBusca))
+        .slice(0, 15);
     }
 
     bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
