@@ -1329,14 +1329,98 @@ app.get('/relay-stream', async (req, res) => {
     }
 
     // 3) Monta headers para o goplay.icu
+// ===== RELAY STREAM (atualizado com cookies + headers completos) =====
+app.get('/relay-stream', async (req, res) => {
+  try {
+    const secret = req.query.relay_secret;
+    if (!secret || secret !== RELAY_SECRET) {
+      console.warn(`⚠️ /relay-stream: secret inválido | IP: ${req.ip}`);
+      return res.status(403).send('Forbidden');
+    }
+
+    const targetUrl = req.query.target;
+    if (!targetUrl) return res.status(400).send('Missing target');
+
+    let parsedTarget;
+    try {
+      parsedTarget = new URL(targetUrl);
+    } catch {
+      return res.status(400).send('Invalid target URL');
+    }
+
+    const allowedHosts = ['goplay.icu'];
+    if (!allowedHosts.some(h => parsedTarget.hostname === h || parsedTarget.hostname.endsWith('.' + h))) {
+      console.warn(`⚠️ /relay-stream: host não permitido: ${parsedTarget.hostname}`);
+      return res.status(403).send('Host not allowed');
+    }
+
+    // === HEADERS MELHORADOS + COOKIES (isso resolve o 403) ===
     const upstreamHeaders = {
-      'User-Agent':      HEADERS['User-Agent'],
-      'Referer':         'http://vouver.me/',
-      'Origin':          'http://vouver.me',
-      'Accept':          '*/*',
-      'Accept-Language': 'pt-BR,pt;q=0.9',
-      'Connection':      'keep-alive',
+      'User-Agent': HEADERS['User-Agent'],
+      'Accept': '*/*',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': 'http://vouver.me/',
+      'Origin': 'http://vouver.me',
+      'Connection': 'keep-alive',
+      'Sec-Fetch-Site': 'cross-site',
+      'Sec-Fetch-Mode': 'no-cors',
+      'Sec-Fetch-Dest': 'video',
+      'Cache-Control': 'no-cache',
+      // ←←← ESSA LINHA É A QUE RESOLVE O 403
+      'Cookie': buildCookieHeader(),   // ← inclui cf_clearance + SESSION_COOKIES
     };
+
+    // Repassa Range (seek no player)
+    const rangeParam = req.query.range || req.headers['range'];
+    if (rangeParam) {
+      upstreamHeaders['Range'] = rangeParam;
+    }
+
+    console.log(`📡 Relay → ${parsedTarget.hostname}${parsedTarget.pathname} | Proxy: ${residentialProxyAgent ? 'residencial' : 'direto'}`);
+
+    const upstream = await axios({
+      method: 'get',
+      url: targetUrl,
+      headers: upstreamHeaders,
+      responseType: 'stream',
+      ...(residentialProxyAgent ? {
+        httpAgent: residentialProxyAgent,
+        httpsAgent: residentialProxyAgent,
+        proxy: false
+      } : {}),
+      timeout: 30000,
+      validateStatus: s => s < 500,
+    });
+
+    console.log(`✅ Relay upstream status: ${upstream.status} (com cookies)`);
+
+    // repassa headers úteis
+    const headersToForward = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    headersToForward.forEach(h => {
+      if (upstream.headers[h]) res.set(h, upstream.headers[h]);
+    });
+
+    res.set('Cache-Control', 'no-store, private');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.status(upstream.status);
+
+    upstream.data.pipe(res);
+
+    upstream.data.on('error', (err) => {
+      console.error('❌ Relay pipe error:', err.message);
+      if (!res.headersSent) res.status(502).send('Stream error');
+    });
+
+    req.on('close', () => {
+      if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
+    });
+
+  } catch (error) {
+    console.error('❌ Erro no /relay-stream:', error.message);
+    if (!res.headersSent) res.status(502).send('Stream error');
+  }
+});
 
     // Repassa Range se vier do Worker (para seek funcionar no player)
     const rangeParam = req.query.range || req.headers['range'];
