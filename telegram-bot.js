@@ -100,6 +100,16 @@ function sanitizarTexto(texto) {
     .trim();
 }
 
+
+function removerAcentos(texto) {
+  if (!texto) return '';
+  return texto
+    .normalize("NFD") // Separa as letras dos acentos
+    .replace(/[\u0300-\u036f]/g, "") // Remove os acentos separados
+    .toLowerCase()
+    .trim();
+}
+
 function formatMoney(centavos) {
   return `R$ ${(centavos / 100).toFixed(2).replace('.', ',')}`;
 }
