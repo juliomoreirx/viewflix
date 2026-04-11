@@ -20,7 +20,7 @@ const telegramBot = require('./telegram-bot');
 // ===== CONFIGURAÇÕES (TODAS DO .ENV) =====
 const DOMINIO_PUBLICO    = process.env.DOMINIO_PUBLICO    || 'http://localhost:3000';
 const JWT_SECRET         = process.env.JWT_SECRET;
-const SIGNED_URL_SECRET  = process.env.SIGNED_URL_SECRET; // novo: openssl rand -hex 32
+const SIGNED_URL_SECRET  = process.env.SIGNED_URL_SECRET;
 const PORT               = process.env.PORT               || 3000;
 const MP_ACCESS_TOKEN    = process.env.MP_ACCESS_TOKEN;
 
@@ -46,8 +46,12 @@ const CF_CLEARANCE = process.env.CF_CLEARANCE || '';
 const SESSION_COOKIES_ENV = process.env.SESSION_COOKIES || '';
 
 // Janela de validade da URL assinada (segundos)
-// Aumente para 120 em redes lentas; 30 é seguro para a maioria
 const SIGNED_URL_TTL = parseInt(process.env.SIGNED_URL_TTL || '60', 10);
+
+// Secret compartilhado entre Worker e VPS para o endpoint /relay-stream
+// Gere com: openssl rand -hex 32
+// Coloque no .env do VPS e no CF Secret (wrangler secret put RELAY_SECRET)
+const RELAY_SECRET = process.env.RELAY_SECRET;
 
 // ===== PROXY RESIDENCIAL =====
 const RES_PROXY_ENABLED = String(process.env.RES_PROXY_ENABLED || 'false')
@@ -72,7 +76,7 @@ if (CLOUDFLARE_WORKER_URL) {
 }
 
 // ===== VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS =====
-const requiredVars = { MONGO_URI, LOGIN_USER, LOGIN_PASS, JWT_SECRET, SIGNED_URL_SECRET };
+const requiredVars = { MONGO_URI, LOGIN_USER, LOGIN_PASS, JWT_SECRET, SIGNED_URL_SECRET, RELAY_SECRET };
 
 for (const [key, value] of Object.entries(requiredVars)) {
   if (!value) {
@@ -94,6 +98,7 @@ console.log(`📡 Base URL: ${BASE_URL}`);
 console.log(`🎬 Movie Base: ${MOVIE_BASE}`);
 console.log(`📺 Video Base: ${VIDEO_BASE}`);
 console.log(`🔐 Signed URL TTL: ${SIGNED_URL_TTL}s`);
+console.log(`🔒 Relay Secret: ${RELAY_SECRET ? 'Configurado' : '❌ AUSENTE'}`);
 
 // ===== CONEXÃO MONGODB =====
 mongoose.connect(MONGO_URI)
@@ -225,7 +230,7 @@ function withOptionalResidentialProxy(axiosConfig = {}, url = '') {
 
 function getHttpClientForUrl(url) {
   if (residentialProxyAgent && shouldUseResidentialProxy(url)) {
-    return clientNoJar; // evita conflito axios-cookiejar-support + Agent
+    return clientNoJar;
   }
   return client;
 }
@@ -316,18 +321,7 @@ function decryptData(encrypted, secret) {
 }
 
 // ===== GERAR / VALIDAR URL ASSINADA =====
-/**
- * Gera uma URL assinada com HMAC-SHA256 que expira em SIGNED_URL_TTL segundos.
- *
- * O path exposto ao cliente é SEMPRE /stream/<videoId>.mp4 — sem user/pass.
- * O Worker (CF) reconstrói internamente a URL real do goplay.icu usando os
- * CF Secrets (LOGIN_USER / LOGIN_PASS), que jamais aparecem na URL pública.
- *
- * Payload da assinatura: "/stream/<videoId>.mp4:<exp>:<userId>"
- * URL final:  https://stream.seudominio.com/stream/<videoId>.mp4?sig=...&exp=...&uid=...&type=movie|series
- */
 function gerarUrlAssinada(videoId, userId, mediaType) {
-  // Path opaco — não contém user nem pass
   const videoPath = `/stream/${videoId}.mp4`;
   const exp       = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL;
 
@@ -337,15 +331,10 @@ function gerarUrlAssinada(videoId, userId, mediaType) {
     .update(sigPayload)
     .digest('hex');
 
-  // CLOUDFLARE_WORKER_URL deve apontar para stream.seudominio.com
   const base = CLOUDFLARE_WORKER_URL || 'https://stream.seudominio.com';
   return `${base}${videoPath}?sig=${sig}&exp=${exp}&uid=${userId}&type=${mediaType}`;
 }
 
-/**
- * Valida uma URL assinada recebida (útil para endpoints de verificação).
- * Retorna true se a assinatura for válida e não expirada.
- */
 function validarUrlAssinada(videoId, sig, exp, userId) {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -1018,11 +1007,12 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    network: residentialProxyAgent ? 'Proxy residencial (vouver/goplay scraping only)' : 'IP direto',
-    streaming: 'Signed redirect direto ao goplay.icu (zero banda VPS)',
+    network: residentialProxyAgent ? 'Proxy residencial ativa' : 'IP direto',
+    streaming: 'Worker → VPS relay → proxy residencial → goplay.icu',
     signedUrlTTL: `${SIGNED_URL_TTL}s`,
     cacheSize: { movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length },
-    session: SESSION_COOKIES ? 'Ativa' : 'Inativa'
+    session: SESSION_COOKIES ? 'Ativa' : 'Inativa',
+    relaySecret: RELAY_SECRET ? 'Configurado' : '❌ AUSENTE'
   });
 });
 
@@ -1110,7 +1100,6 @@ app.get('/player/:token', async (req, res) => {
     purchase.viewCount += 1;
     await purchase.save();
 
-    // O endpoint /api/stream-secure agora retorna 302 redirect — sem banda da VPS
     const streamPath = `/api/stream-secure/${req.params.token}/${purchase.sessionToken}`;
 
     res.send(`
@@ -1178,8 +1167,6 @@ app.get('/player/:token', async (req, res) => {
       player = videojs('player');
       player.el().addEventListener('contextmenu', e => { e.preventDefault(); return false; });
 
-      // Força carregamento imediato — a URL assinada expira em ${SIGNED_URL_TTL}s
-      // O Video.js segue o 302 redirect e obtém a URL real do goplay.icu
       player.ready(function() { player.load(); });
 
       let playLogged = false;
@@ -1194,7 +1181,6 @@ app.get('/player/:token', async (req, res) => {
         }
       });
 
-      // Se o stream falhar (URL expirou antes de iniciar), recarrega o src
       player.on('error', function() {
         const err = player.error();
         if (err && (err.code === 2 || err.code === 4)) {
@@ -1239,9 +1225,7 @@ app.get('/player/:token', async (req, res) => {
   }
 });
 
-// ===== ENDPOINT: Signed Redirect — ZERO BANDA NA VPS =====
-// Valida JWT + compra, depois emite 302 com URL HMAC-assinada direto ao goplay.icu.
-// O vídeo flui: cliente → goplay.icu (sem passar pela VPS).
+// ===== ENDPOINT: Signed URL → Worker =====
 app.get('/api/stream-secure/:token/:sessionToken',
   detectSuspiciousClient,
   advancedRateLimit,
@@ -1265,11 +1249,10 @@ app.get('/api/stream-secure/:token/:sessionToken',
         return res.sendStatus(403);
       }
 
-      const signedUrl  = gerarUrlAssinada(videoId, userId, mediaType);
+      const signedUrl = gerarUrlAssinada(videoId, userId, mediaType);
 
-      console.log(`🔀 Redirect assinado: User ${userId} | Vídeo ${videoId} | TTL ${SIGNED_URL_TTL}s`);
+      console.log(`🔀 Signed URL gerada: User ${userId} | Vídeo ${videoId} | TTL ${SIGNED_URL_TTL}s`);
 
-      // Anti-cache: cada redirect gera uma URL única (exp muda a cada chamada)
       res.setHeader('Cache-Control', 'no-store, no-cache, private, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1283,8 +1266,7 @@ app.get('/api/stream-secure/:token/:sessionToken',
   }
 );
 
-// ===== ENDPOINT: Refresh do link de stream (fallback se URL expirou antes do play) =====
-// Chamado pelo player via fetch quando ocorre erro de carregamento.
+// ===== ENDPOINT: Refresh do link de stream =====
 app.get('/api/refresh-stream/:token/:sessionToken',
   detectSuspiciousClient,
   async (req, res) => {
@@ -1312,6 +1294,107 @@ app.get('/api/refresh-stream/:token/:sessionToken',
     }
   }
 );
+
+// ===== ENDPOINT: RELAY STREAM =====
+// Chamado exclusivamente pelo Cloudflare Worker (autenticado via RELAY_SECRET).
+// Faz pipe do vídeo usando a proxy residencial — IP nunca é da Cloudflare.
+// O usuário nunca acessa esta rota diretamente; ela não aparece no browser.
+app.get('/relay-stream', async (req, res) => {
+  try {
+    // 1) Valida o secret compartilhado com o Worker
+    const secret = req.query.relay_secret;
+    if (!secret || secret !== RELAY_SECRET) {
+      console.warn(`⚠️ /relay-stream: secret inválido | IP: ${req.ip}`);
+      return res.status(403).send('Forbidden');
+    }
+
+    // 2) Valida e sanitiza a URL de destino
+    const targetUrl = req.query.target;
+    if (!targetUrl) {
+      return res.status(400).send('Missing target');
+    }
+
+    // Aceita apenas URLs do goplay.icu para evitar SSRF
+    let parsedTarget;
+    try {
+      parsedTarget = new URL(targetUrl);
+    } catch {
+      return res.status(400).send('Invalid target URL');
+    }
+
+    const allowedHosts = ['goplay.icu'];
+    if (!allowedHosts.some(h => parsedTarget.hostname === h || parsedTarget.hostname.endsWith('.' + h))) {
+      console.warn(`⚠️ /relay-stream: host não permitido: ${parsedTarget.hostname}`);
+      return res.status(403).send('Host not allowed');
+    }
+
+    // 3) Monta headers para o goplay.icu
+    const upstreamHeaders = {
+      'User-Agent':      HEADERS['User-Agent'],
+      'Referer':         'http://vouver.me/',
+      'Origin':          'http://vouver.me',
+      'Accept':          '*/*',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+      'Connection':      'keep-alive',
+    };
+
+    // Repassa Range se vier do Worker (para seek funcionar no player)
+    const rangeParam = req.query.range || req.headers['range'];
+    if (rangeParam) {
+      upstreamHeaders['Range'] = rangeParam;
+    }
+
+    console.log(`📡 Relay → ${parsedTarget.hostname}${parsedTarget.pathname} | Proxy: ${residentialProxyAgent ? 'residencial' : 'direto'}`);
+
+    // 4) Faz o request usando a proxy residencial
+    const upstream = await axios({
+      method:       'get',
+      url:          targetUrl,
+      headers:      upstreamHeaders,
+      responseType: 'stream',
+      // Usa a proxy residencial se configurada — este é o ponto chave
+      ...(residentialProxyAgent ? {
+        httpAgent:  residentialProxyAgent,
+        httpsAgent: residentialProxyAgent,
+        proxy:      false
+      } : {}),
+      timeout: 30000,
+      validateStatus: s => s < 500,
+    });
+
+    console.log(`✅ Relay upstream status: ${upstream.status}`);
+
+    // 5) Repassa headers relevantes para o Worker/cliente
+    const headersToForward = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    headersToForward.forEach(h => {
+      if (upstream.headers[h]) res.set(h, upstream.headers[h]);
+    });
+
+    res.set('Cache-Control', 'no-store, private');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.status(upstream.status);
+
+    // 6) Pipe do stream diretamente para o Worker
+    upstream.data.pipe(res);
+
+    // Lida com erros durante o pipe
+    upstream.data.on('error', (err) => {
+      console.error('❌ Relay pipe error:', err.message);
+      if (!res.headersSent) res.status(502).send('Stream error');
+    });
+
+    req.on('close', () => {
+      // Cliente desconectou — destrói o stream upstream para não desperdiçar banda
+      if (upstream.data && typeof upstream.data.destroy === 'function') {
+        upstream.data.destroy();
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Erro no /relay-stream:', error.message);
+    if (!res.headersSent) res.status(502).send('Stream error');
+  }
+});
 
 app.post('/api/log-view', async (req, res) => {
   try {
@@ -1346,8 +1429,8 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         expired: await PurchasedContent.countDocuments({ expiresAt: { $lte: new Date() } })
       },
       catalog: { movies: CACHE_CONTEUDO.movies.length, series: CACHE_CONTEUDO.series.length },
-      network:  residentialProxyAgent ? 'Proxy residencial (scraping only)' : 'IP direto',
-      streaming: `Signed redirect → goplay.icu direto (TTL: ${SIGNED_URL_TTL}s)`,
+      network:  residentialProxyAgent ? 'Proxy residencial ativa (scraping + relay)' : 'IP direto',
+      streaming: `Worker → VPS relay → proxy residencial → goplay.icu`,
       session:   SESSION_COOKIES ? 'Ativa' : 'Inativa'
     };
     res.json(stats);
@@ -1444,10 +1527,6 @@ async function iniciarServidor() {
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.error('⚠️ MODO DEGRADADO ATIVADO');
         console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.error('Login falhou e SESSION_COOKIES não definido.');
-        console.error('Solução: rode capturar-cookies.js localmente');
-        console.error('e cole SESSION_COOKIES=... no .env do servidor.');
-        console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         userSession.user = LOGIN_USER;
         userSession.pass = LOGIN_PASS;
       }
@@ -1461,13 +1540,15 @@ async function iniciarServidor() {
 
     app.listen(PORT, () => {
       console.log('\n' + '='.repeat(60));
-      console.log('🚀 FastTV Server — Signed Redirect Edition');
+      console.log('🚀 FastTV Server — Relay Edition');
       console.log('='.repeat(60));
       console.log(`📡 Servidor:      ${DOMINIO_PUBLICO}`);
-      console.log(`🔀 Streaming:     302 redirect → goplay.icu direto`);
+      console.log(`🔀 Streaming:     Worker → VPS /relay-stream → proxy → goplay.icu`);
       console.log(`🔐 Assinatura:    HMAC-SHA256 / TTL ${SIGNED_URL_TTL}s`);
       console.log(`🌐 Rede scraping: ${residentialProxyAgent ? 'Proxy residencial' : 'IP direto'}`);
+      console.log(`🌐 Rede relay:    ${residentialProxyAgent ? 'Proxy residencial' : '⚠️ IP direto (configure RES_PROXY_ENABLED=true)'}`);
       console.log(`☁️ Worker:        ${CLOUDFLARE_WORKER_URL ? 'Ativo' : 'Inativo'}`);
+      console.log(`🔒 Relay Secret:  ${RELAY_SECRET ? 'Configurado' : '❌ AUSENTE'}`);
       console.log(`🎬 Player:        Video.js com refresh automático`);
       console.log(`💰 Preços:        R$ 2,50/hora (cálculo proporcional)`);
       console.log(`🤖 Bot:           Ativo`);
